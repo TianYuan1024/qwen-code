@@ -4888,7 +4888,7 @@ hello
       );
       expect(operatorReminder).toBeDefined();
       expect(operatorReminder).toMatch(
-        /^<system-reminder>\n.*当前操作者: Alice.*\n<\/system-reminder>$/s,
+        /^<system-reminder>\n\[operator\] .*当前操作者: Alice.*\n<\/system-reminder>$/s,
       );
 
       const escapedReminder = callArgs.find((p) => p.includes('injected'));
