@@ -7510,6 +7510,7 @@ describe('sessionRuntimeContext handler', () => {
   });
 
   afterEach(() => {
+    mockConnectionState.resolve();
     processExitSpy.mockRestore();
     stdinDestroySpy.mockRestore();
     stdoutDestroySpy.mockRestore();
