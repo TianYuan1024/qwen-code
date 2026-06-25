@@ -4977,9 +4977,8 @@ describe('Model Switching and Config Updates', () => {
     }
 
     it('resolves getters to the runtime view inside the frame, instance fields outside', async () => {
-      const { runWithRuntimeContentGenerator } = await import(
-        '../agents/runtime/agent-context.js'
-      );
+      const { runWithRuntimeContentGenerator } =
+        await import('../agents/runtime/agent-context.js');
       const config = new Config(baseParams);
       const parentGenerator = {
         generateContentStream: vi.fn(),
@@ -5026,9 +5025,8 @@ describe('Model Switching and Config Updates', () => {
     });
 
     it('falls back to the parent model id when the runtime view config has no model', async () => {
-      const { runWithRuntimeContentGenerator } = await import(
-        '../agents/runtime/agent-context.js'
-      );
+      const { runWithRuntimeContentGenerator } =
+        await import('../agents/runtime/agent-context.js');
       const config = new Config(baseParams);
       setInstanceFields(
         config,
@@ -5213,6 +5211,82 @@ describe('Model Switching and Config Updates', () => {
         bareMode: true,
       });
       expect(config.getAutoSkillConfirmEnabled()).toBe(false);
+    });
+  });
+
+  describe('RuntimeContext', () => {
+    it('should start empty', () => {
+      const config = new Config(baseParams);
+      expect(config.getRuntimeContext().size).toBe(0);
+    });
+
+    it('should set and get an entry', () => {
+      const config = new Config(baseParams);
+      expect(config.setRuntimeContextEntry('operator', 'Alice')).toBe(true);
+      expect(config.getRuntimeContext().get('operator')).toBe('Alice');
+    });
+
+    it('should delete entry when value is empty', () => {
+      const config = new Config(baseParams);
+      config.setRuntimeContextEntry('operator', 'Alice');
+      expect(config.setRuntimeContextEntry('operator', '')).toBe(true);
+      expect(config.getRuntimeContext().has('operator')).toBe(false);
+    });
+
+    it('should remove entry by key', () => {
+      const config = new Config(baseParams);
+      config.setRuntimeContextEntry('operator', 'Alice');
+      config.removeRuntimeContextEntry('operator');
+      expect(config.getRuntimeContext().size).toBe(0);
+    });
+
+    it('should reject invalid keys and return false', () => {
+      const config = new Config(baseParams);
+      expect(config.setRuntimeContextEntry('invalid key!', 'value')).toBe(
+        false,
+      );
+      expect(config.setRuntimeContextEntry('', 'value')).toBe(false);
+      expect(config.setRuntimeContextEntry('a'.repeat(65), 'value')).toBe(
+        false,
+      );
+      expect(config.getRuntimeContext().size).toBe(0);
+    });
+
+    it('should reject values exceeding 32 KiB and return false', () => {
+      const config = new Config(baseParams);
+      expect(
+        config.setRuntimeContextEntry('big', 'x'.repeat(32 * 1024 + 1)),
+      ).toBe(false);
+      expect(config.getRuntimeContext().size).toBe(0);
+    });
+
+    it('should enforce 16 entry limit', () => {
+      const config = new Config(baseParams);
+      for (let i = 0; i < 20; i++) {
+        config.setRuntimeContextEntry(`key-${i}`, `value-${i}`);
+      }
+      expect(config.getRuntimeContext().size).toBe(16);
+    });
+
+    it('should allow updating existing key even at capacity', () => {
+      const config = new Config(baseParams);
+      for (let i = 0; i < 16; i++) {
+        config.setRuntimeContextEntry(`key-${i}`, `value-${i}`);
+      }
+      config.setRuntimeContextEntry('key-0', 'updated');
+      expect(config.getRuntimeContext().get('key-0')).toBe('updated');
+    });
+
+    it('should bulk-set entries', () => {
+      const config = new Config(baseParams);
+      config.setRuntimeContextEntry('old', 'stale');
+      config.setRuntimeContext({
+        operator: 'Alice',
+        rules: 'Do not modify prod',
+      });
+      expect(config.getRuntimeContext().size).toBe(2);
+      expect(config.getRuntimeContext().has('old')).toBe(false);
+      expect(config.getRuntimeContext().get('operator')).toBe('Alice');
     });
   });
 });

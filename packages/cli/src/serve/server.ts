@@ -836,7 +836,7 @@ function resolveDaemonTelemetryRoute(
     return { route: 'GET /daemon/status' };
   }
   const sessionAction = path.match(
-    /^\/session\/([^/]+)\/(load|resume|prompt|cancel|recap|btw|mid-turn-message|model|shell|detach|rewind|approval-mode|language|a2ui-action)$/,
+    /^\/session\/([^/]+)\/(load|resume|prompt|cancel|recap|btw|mid-turn-message|model|shell|detach|rewind|approval-mode|language|runtime-context|a2ui-action)$/,
   );
   const sessionActionId = sessionAction?.[1];
   const sessionActionName = sessionAction?.[2];
@@ -4241,6 +4241,51 @@ export function createServeApp(
     } catch (err) {
       sendBridgeError(res, err, {
         route: 'POST /session/:id/language',
+        sessionId,
+      });
+    }
+  });
+
+  app.post('/session/:id/runtime-context', mutate(), async (req, res) => {
+    const sessionId = req.params['id'];
+    const body = safeBody(req);
+    const entries = body['entries'];
+
+    if (
+      typeof entries !== 'object' ||
+      entries === null ||
+      Array.isArray(entries)
+    ) {
+      res.status(400).json({
+        error:
+          '`entries` is required and must be a non-null object mapping string keys to string values',
+        code: 'invalid_entries',
+      });
+      return;
+    }
+
+    const serialized = JSON.stringify(entries);
+    if (serialized.length > 32 * 1024) {
+      res.status(413).json({
+        error: 'runtime context payload exceeds 32 KiB limit',
+        code: 'payload_too_large',
+      });
+      return;
+    }
+
+    const clientId = parseClientIdHeader(req, res);
+    if (clientId === null) return;
+
+    try {
+      const response = await bridge.setSessionRuntimeContext(
+        sessionId,
+        entries as Record<string, string>,
+        clientId !== undefined ? { clientId } : undefined,
+      );
+      res.status(200).json(response);
+    } catch (err) {
+      sendBridgeError(res, err, {
+        route: 'POST /session/:id/runtime-context',
         sessionId,
       });
     }

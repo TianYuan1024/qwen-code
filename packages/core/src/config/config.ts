@@ -1320,6 +1320,7 @@ export class Config {
   private mcpReconcilePromise: Promise<void> | undefined;
   private sessionSubagents: SubagentConfig[];
   private userMemory: string;
+  private runtimeContextEntries: Map<string, string> = new Map();
   private sdkMode: boolean;
   private geminiMdFileCount: number;
   private conditionalRulesRegistry: ConditionalRulesRegistry | undefined;
@@ -3879,6 +3880,56 @@ export class Config {
     this.userMemory = newUserMemory;
   }
 
+  private static readonly RUNTIME_CONTEXT_KEY_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+  private static readonly RUNTIME_CONTEXT_MAX_VALUE_BYTES = 32 * 1024;
+  private static readonly RUNTIME_CONTEXT_MAX_ENTRIES = 16;
+
+  getRuntimeContext(): ReadonlyMap<string, string> {
+    return this.runtimeContextEntries;
+  }
+
+  setRuntimeContextEntry(key: string, value: string): boolean {
+    if (!Config.RUNTIME_CONTEXT_KEY_RE.test(key)) {
+      return false;
+    }
+    if (!value) {
+      this.runtimeContextEntries.delete(key);
+      return true;
+    }
+    if (
+      Buffer.byteLength(value, 'utf8') > Config.RUNTIME_CONTEXT_MAX_VALUE_BYTES
+    ) {
+      return false;
+    }
+    if (
+      !this.runtimeContextEntries.has(key) &&
+      this.runtimeContextEntries.size >= Config.RUNTIME_CONTEXT_MAX_ENTRIES
+    ) {
+      return false;
+    }
+    this.runtimeContextEntries.set(key, value);
+    return true;
+  }
+
+  removeRuntimeContextEntry(key: string): void {
+    this.runtimeContextEntries.delete(key);
+  }
+
+  setRuntimeContext(entries: Record<string, string>): void {
+    this.runtimeContextEntries.clear();
+    for (const [key, value] of Object.entries(entries)) {
+      if (
+        value &&
+        Config.RUNTIME_CONTEXT_KEY_RE.test(key) &&
+        Buffer.byteLength(value, 'utf8') <=
+          Config.RUNTIME_CONTEXT_MAX_VALUE_BYTES &&
+        this.runtimeContextEntries.size < Config.RUNTIME_CONTEXT_MAX_ENTRIES
+      ) {
+        this.runtimeContextEntries.set(key, value);
+      }
+    }
+  }
+
   getGeminiMdFileCount(): number {
     return this.geminiMdFileCount;
   }
@@ -5282,9 +5333,8 @@ export class Config {
       if (options?.forSubAgent) return;
       const schema = this.jsonSchema;
       await registerLazy(ToolNames.STRUCTURED_OUTPUT, async () => {
-        const { SyntheticOutputTool } = await import(
-          '../tools/syntheticOutput.js'
-        );
+        const { SyntheticOutputTool } =
+          await import('../tools/syntheticOutput.js');
         return new SyntheticOutputTool(schema);
       });
     };
@@ -5319,9 +5369,8 @@ export class Config {
       return new ToolSearchTool(this);
     });
     await registerLazy(ToolNames.READ_MCP_RESOURCE, async () => {
-      const { ReadMcpResourceTool } = await import(
-        '../tools/read-mcp-resource.js'
-      );
+      const { ReadMcpResourceTool } =
+        await import('../tools/read-mcp-resource.js');
       return new ReadMcpResourceTool(this);
     });
     await registerLazy(ToolNames.AGENT, async () => {
@@ -5409,9 +5458,8 @@ export class Config {
       return new TodoWriteTool(this);
     });
     await registerLazy(ToolNames.ASK_USER_QUESTION, async () => {
-      const { AskUserQuestionTool } = await import(
-        '../tools/askUserQuestion.js'
-      );
+      const { AskUserQuestionTool } =
+        await import('../tools/askUserQuestion.js');
       return new AskUserQuestionTool(this);
     });
     if (!this.sdkMode) {
@@ -5438,9 +5486,8 @@ export class Config {
     });
     if (this.isArtifactEnabled()) {
       await registerLazy(ToolNames.ARTIFACT, async () => {
-        const { ArtifactTool } = await import(
-          '../tools/artifact/artifact-tool.js'
-        );
+        const { ArtifactTool } =
+          await import('../tools/artifact/artifact-tool.js');
         return new ArtifactTool(this);
       });
     }
@@ -5523,9 +5570,8 @@ export class Config {
     // built-in also gates these. Direct registry.registerFactory() would
     // bypass coreTools allowlist + whole-tool deny rules.
     if (this.isComputerUseEnabled()) {
-      const { registerComputerUseTools } = await import(
-        '../tools/computer-use/index.js'
-      );
+      const { registerComputerUseTools } =
+        await import('../tools/computer-use/index.js');
       await registerComputerUseTools(registerLazy, this);
     }
 
