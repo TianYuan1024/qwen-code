@@ -96,6 +96,7 @@ import type {
   ServeWorkspaceHooksStatus,
   ServeWorkspaceMcpStatus,
   ServeWorkspaceMcpToolsStatus,
+  ServeWorkspaceMcpResourcesStatus,
   ServeWorkspacePreflightStatus,
   ServeWorkspaceProvidersStatus,
   ServeWorkspaceSkillsStatus,
@@ -202,6 +203,7 @@ const EXPECTED_STAGE1_FEATURES = [
   'session_tasks',
   'session_stats',
   'session_lsp',
+  'session_status',
   'session_close',
   'session_metadata',
   // Issue #4175 PR 14. Always-on. Daemon supports the MCP client
@@ -384,10 +386,14 @@ interface FakeBridgeOpts {
     context?: BridgeClientRequestContext,
   ) => boolean;
   listImpl?: (workspaceCwd: string) => BridgeSessionSummary[];
+  summaryImpl?: (sessionId: string) => BridgeSessionSummary;
   workspaceMcpImpl?: () => Promise<ServeWorkspaceMcpStatus>;
   workspaceMcpToolsImpl?: (
     serverName: string,
   ) => Promise<ServeWorkspaceMcpToolsStatus>;
+  workspaceMcpResourcesImpl?: (
+    serverName: string,
+  ) => Promise<ServeWorkspaceMcpResourcesStatus>;
   workspaceSkillsImpl?: () => Promise<ServeWorkspaceSkillsStatus>;
   workspaceToolsImpl?: () => Promise<ServeWorkspaceToolsStatus>;
   workspaceProvidersImpl?: () => Promise<ServeWorkspaceProvidersStatus>;
@@ -560,8 +566,10 @@ interface FakeBridge extends AcpSessionBridge {
     context?: BridgeClientRequestContext;
   }>;
   listCalls: string[];
+  summaryCalls: string[];
   workspaceMcpCalls: number;
   workspaceMcpToolsCalls: string[];
+  workspaceMcpResourcesCalls: string[];
   workspaceSkillsCalls: number;
   workspaceToolsCalls: number;
   workspaceProvidersCalls: number;
@@ -685,8 +693,10 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
   const permissionVotes: FakeBridge['permissionVotes'] = [];
   const sessionPermissionVotes: FakeBridge['sessionPermissionVotes'] = [];
   const listCalls: string[] = [];
+  const summaryCalls: string[] = [];
   let workspaceMcpCalls = 0;
   const workspaceMcpToolsCalls: string[] = [];
+  const workspaceMcpResourcesCalls: string[] = [];
   let workspaceSkillsCalls = 0;
   let workspaceToolsCalls = 0;
   let workspaceProvidersCalls = 0;
@@ -743,6 +753,11 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
   const respondImpl = opts.respondImpl ?? (() => true);
   const sessionRespondImpl = opts.sessionRespondImpl ?? (() => true);
   const listImpl = opts.listImpl ?? (() => []);
+  const summaryImpl =
+    opts.summaryImpl ??
+    ((sessionId: string): BridgeSessionSummary => {
+      throw new SessionNotFoundError(sessionId);
+    });
   const workspaceMcpImpl =
     opts.workspaceMcpImpl ??
     (async () => ({
@@ -778,6 +793,16 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
       initialized: true,
       acpChannelLive: false,
       tools: [],
+    }));
+  const workspaceMcpResourcesImpl =
+    opts.workspaceMcpResourcesImpl ??
+    (async (serverName: string) => ({
+      v: 1 as const,
+      workspaceCwd: WS_BOUND,
+      serverName,
+      initialized: true,
+      acpChannelLive: false,
+      resources: [],
     }));
   const workspaceProvidersImpl =
     opts.workspaceProvidersImpl ??
@@ -1079,7 +1104,9 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
     permissionVotes,
     sessionPermissionVotes,
     listCalls,
+    summaryCalls,
     workspaceMcpToolsCalls,
+    workspaceMcpResourcesCalls,
     extensionEvents,
     sessionContextCalls,
     sessionContextUsageCalls,
@@ -1220,6 +1247,10 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
       listCalls.push(workspaceCwd);
       return listImpl(workspaceCwd);
     },
+    getSessionSummary(sessionId) {
+      summaryCalls.push(sessionId);
+      return summaryImpl(sessionId);
+    },
     async getWorkspaceMcpStatus() {
       workspaceMcpCalls += 1;
       return workspaceMcpImpl();
@@ -1227,6 +1258,10 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
     async getWorkspaceMcpToolsStatus(serverName) {
       workspaceMcpToolsCalls.push(serverName);
       return workspaceMcpToolsImpl(serverName);
+    },
+    async getWorkspaceMcpResourcesStatus(serverName) {
+      workspaceMcpResourcesCalls.push(serverName);
+      return workspaceMcpResourcesImpl(serverName);
     },
     async getWorkspaceSkillsStatus() {
       workspaceSkillsCalls += 1;
@@ -6383,6 +6418,74 @@ describe('createServeApp', () => {
         .set('Host', `127.0.0.1:${baseOpts.port}`);
       expect(res.status).toBe(400);
       expect(bridge.listCalls).toHaveLength(0);
+    });
+  });
+
+  describe('GET /session/:id/status', () => {
+    it('200 with the live session summary', async () => {
+      const summary: BridgeSessionSummary = {
+        sessionId: 's-1',
+        workspaceCwd: WS_BOUND,
+        createdAt: '2026-05-17T12:00:00.000Z',
+        displayName: 'demo',
+        clientCount: 2,
+        hasActivePrompt: true,
+      };
+      const bridge = fakeBridge({ summaryImpl: () => summary });
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+
+      const res = await request(app)
+        .get('/session/s-1/status')
+        .set('Host', `127.0.0.1:${baseOpts.port}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(summary);
+      expect(bridge.summaryCalls).toEqual(['s-1']);
+    });
+
+    it('200 omits displayName when the live session has none', async () => {
+      const summary: BridgeSessionSummary = {
+        sessionId: 's-2',
+        workspaceCwd: WS_BOUND,
+        createdAt: '2026-05-17T12:00:00.000Z',
+        clientCount: 0,
+        hasActivePrompt: false,
+      };
+      const bridge = fakeBridge({ summaryImpl: () => summary });
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+
+      const res = await request(app)
+        .get('/session/s-2/status')
+        .set('Host', `127.0.0.1:${baseOpts.port}`);
+
+      expect(res.status).toBe(200);
+      expect('displayName' in res.body).toBe(false);
+    });
+
+    it('404 when the session id is unknown to the daemon', async () => {
+      // fakeBridge's default getSessionSummary throws SessionNotFoundError.
+      const bridge = fakeBridge();
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+
+      const res = await request(app)
+        .get('/session/ghost/status')
+        .set('Host', `127.0.0.1:${baseOpts.port}`);
+
+      expect(res.status).toBe(404);
+      expect(res.body.sessionId).toBe('ghost');
+      expect(bridge.summaryCalls).toEqual(['ghost']);
     });
   });
 
@@ -12349,6 +12452,41 @@ describe('GET /workspace/mcp/:server/tools', () => {
     expect(res.status).toBe(400);
     expect(res.body.code).toBe('invalid_server_name');
     expect(bridge.workspaceMcpToolsCalls).toHaveLength(0);
+  });
+});
+
+describe('GET /workspace/mcp/:server/resources', () => {
+  it('returns resources for a valid server name', async () => {
+    const bridge = fakeBridge();
+    const app = createServeApp(baseOpts, undefined, { bridge });
+    const res = await request(app)
+      .get('/workspace/mcp/my-server/resources')
+      .set('Host', `127.0.0.1:${baseOpts.port}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ serverName: 'my-server', resources: [] });
+    expect(bridge.workspaceMcpResourcesCalls).toEqual(['my-server']);
+  });
+
+  it('decodes URL-encoded server names', async () => {
+    const bridge = fakeBridge();
+    const app = createServeApp(baseOpts, undefined, { bridge });
+    const res = await request(app)
+      .get('/workspace/mcp/my%20server/resources')
+      .set('Host', `127.0.0.1:${baseOpts.port}`);
+    expect(res.status).toBe(200);
+    expect(bridge.workspaceMcpResourcesCalls).toEqual(['my server']);
+  });
+
+  it('400 when server name exceeds length limit', async () => {
+    const bridge = fakeBridge();
+    const app = createServeApp(baseOpts, undefined, { bridge });
+    const longName = 'a'.repeat(300);
+    const res = await request(app)
+      .get(`/workspace/mcp/${longName}/resources`)
+      .set('Host', `127.0.0.1:${baseOpts.port}`);
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('invalid_server_name');
+    expect(bridge.workspaceMcpResourcesCalls).toHaveLength(0);
   });
 });
 
