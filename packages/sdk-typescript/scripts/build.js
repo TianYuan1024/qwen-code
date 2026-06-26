@@ -34,7 +34,9 @@ const rootDir = join(__dirname, '..');
 // Bumped from 126KB to 127KB for prompt clientId self-heal.
 // Bumped from 127KB to 130KB for daemon workspace voice, trust, permissions,
 // session LSP helper APIs, and the full daemon route table.
-// Bumped from 130KB to 131KB for sessionless workspace memory remember APIs.
+// Bumped from 130KB to 131KB for sessionless workspace memory remember APIs
+// and the workspace MCP resources drill-down (workspaceMcpResources client
+// method + route + resource status types).
 const MAX_DAEMON_BROWSER_BUNDLE_BYTES = 131 * 1024;
 
 rmSync(join(rootDir, 'dist'), { recursive: true, force: true });
