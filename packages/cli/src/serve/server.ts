@@ -126,6 +126,7 @@ import {
   mountWebShellSpaFallback,
 } from './web-shell-static.js';
 import { mountWorkspaceMemoryRoutes } from './workspace-memory.js';
+import { mountWorkspaceMemoryRememberRoutes } from './workspace-remember.js';
 import { mountWorkspaceAgentsRoutes } from './workspace-agents.js';
 import {
   createWorkspaceFileSystemFactory,
@@ -2228,6 +2229,12 @@ export function createServeApp(
   mountWorkspaceMemoryRoutes(app, {
     bridge,
     boundWorkspace,
+    mutate,
+    parseClientId: parseClientIdHeader,
+    safeBody,
+  });
+  mountWorkspaceMemoryRememberRoutes(app, {
+    bridge,
     mutate,
     parseClientId: parseClientIdHeader,
     safeBody,
