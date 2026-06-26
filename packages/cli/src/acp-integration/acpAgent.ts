@@ -219,6 +219,7 @@ import {
   type ServeWorkspaceExtensionsStatus,
   IDLE_HOOK_EVENTS,
 } from '../serve/status.js';
+import { MAX_REMEMBER_CONTENT_BYTES } from '../serve/workspace-memory-remember-constants.js';
 import {
   collectContextData,
   formatContextUsageText,
@@ -5137,6 +5138,12 @@ class QwenAgent implements Agent {
           throw RequestError.invalidParams(
             undefined,
             'Invalid or missing content',
+          );
+        }
+        if (Buffer.byteLength(content, 'utf8') > MAX_REMEMBER_CONTENT_BYTES) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Content exceeds maximum size',
           );
         }
         const rawContextMode = params['contextMode'] ?? 'workspace';
