@@ -24,8 +24,8 @@ missing a PR that needs evidence is not.
 ## Non-goals
 
 - Do not run full triage, review, or tmux testing for untrusted PR authors.
-- Do not execute PR code.
-- Do not check out the PR head.
+- Do not execute PR code: no install, build, test, scripts, or tmux session.
+- Do not check out the PR head as a working tree.
 - Do not post model-generated prose directly to GitHub.
 - Do not decide whether the implementation is correct.
 
@@ -35,7 +35,8 @@ Create a separate PR intake workflow that runs on `pull_request_target` for PR
 open, edit, synchronize, and ready-for-review events. It runs on
 `ubuntu-latest`, not ECS.
 
-The workflow gathers only GitHub metadata:
+The workflow gathers PR text and code through GitHub APIs, without executing
+the PR:
 
 - PR title and body.
 - Changed file list.
@@ -68,7 +69,9 @@ side effects.
 The workflow should:
 
 - Use `permissions: contents: read, pull-requests: read, issues: write`.
-- Avoid checking out PR head code.
+- Read PR code through API-provided patches and capped source snippets.
+- Avoid checking out PR head code as a working tree.
+- Never run PR-controlled code or package lifecycle scripts.
 - Treat PR text and diff as untrusted input.
 - Pass untrusted input via files or JSON, not shell interpolation.
 - Use a fixed marker comment such as `<!-- qwen-pr-intake:evidence -->`.
