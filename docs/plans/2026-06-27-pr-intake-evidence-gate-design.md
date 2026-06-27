@@ -60,6 +60,37 @@ metadata and diff and returns strict JSON only:
 The model has no tools and no GitHub token. A deterministic script parses the
 JSON and decides whether to post or update a fixed maintainer-authored comment.
 
+## Workflow Split
+
+Use two workflows with a shared evidence policy.
+
+The new PR intake workflow should cover the automatic, low-trust path:
+
+- Trigger on `pull_request_target` for non-draft PR open, edit, synchronize,
+  and ready-for-review events.
+- Run for external fork PRs and same-repository PRs.
+- Read PR metadata, diffs, and capped source snippets.
+- Run only the constrained evidence classifier.
+- Post or delete only the fixed marker comment.
+- Never invoke the full triage skill, review action, tmux testing, checkout of
+  PR head code, dependency install, build, or tests.
+
+The existing Qwen triage workflow should keep the manual escalation path:
+
+- Trigger from maintainer comments such as `@qwen-code /triage`.
+- Gate on the comment author's write-or-higher repository permission.
+- Run the full triage skill only after that explicit maintainer request.
+- Keep higher-risk operations out of the automatic external PR path.
+
+This split is not meant to create two inconsistent rule systems. The evidence
+standard should be shared as a small policy document or prompt fragment, so the
+lightweight intake classifier and the full triage skill ask for the same kind of
+reviewer evidence.
+
+Combining both paths into one workflow is possible with separate jobs and strict
+`if` conditions, but it makes the trust boundary easier to blur. The first
+version should keep the workflows separate and boring.
+
 ## Safety Boundary
 
 The model is allowed to classify, not act. It cannot run shell commands, call
