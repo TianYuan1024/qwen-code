@@ -40,6 +40,8 @@ The workflow gathers only GitHub metadata:
 - PR title and body.
 - Changed file list.
 - Patch diff from the GitHub API.
+- Capped base/head source snippets for changed files when the patch is too
+  small, truncated, or ambiguous.
 - Template sections relevant to reviewer evidence.
 
 It then calls a constrained model classifier. The classifier receives the PR
@@ -108,10 +110,63 @@ self-hosted ECS pool, and keeping it hosted avoids persistent-runner state risk.
 If model access later requires a private network, use a separate isolated runner
 rather than the current review/tmux ECS pool.
 
-## Open Questions
+## Ponytail Defaults
 
-- Which model endpoint should the intake classifier use?
-- Should the workflow comment only, or also apply an existing status label?
-- Should draft PRs be skipped until ready-for-review?
-- Should a resolved marker comment be edited or deleted?
-- What exact evidence forms count as sufficient for the first version?
+These defaults keep the first implementation small and reversible.
+
+### Model endpoint
+
+Use the existing PR review model settings:
+
+- `secrets.REVIEW_OPENAI_API_KEY`
+- `secrets.REVIEW_OPENAI_BASE_URL`
+- `vars.QWEN_PR_REVIEW_MODEL`
+
+Do not add new secrets, vars, model routing, or a model-selection UI for the
+first version. This is a PR-review-adjacent classifier, so the existing review
+model is the least new machinery.
+
+### GitHub side effects
+
+Comment only. Do not add or remove labels in v1.
+
+Labels introduce lifecycle questions: when to apply, when to clear, how to avoid
+conflicting with maintainer labels, and how to coordinate with existing triage
+labels. A marker comment is enough for intake pressure.
+
+### Draft PRs
+
+Skip draft PRs. Run on `ready_for_review`, `opened`, `edited`, and
+`synchronize` when the PR is not draft.
+
+Drafts are explicitly not ready for maintainer intake, so commenting on missing
+evidence there is noise.
+
+### Resolved comments
+
+If a marker comment exists and the latest PR body now has enough evidence,
+delete the marker comment. Do not leave a "resolved" bot comment.
+
+The desired state is simple: no problem, no bot comment.
+
+### Sufficient evidence for v1
+
+Accept one of these in the `Evidence (Before & After)` section:
+
+- Markdown image or HTML image.
+- GitHub-uploaded attachment link.
+- Video link or attachment (`.mp4`, `.mov`, `.webm`) or an asciinema link.
+- A fenced code block with real terminal output, such as tmux capture output,
+  before/after command output, or a short interactive transcript.
+- `N/A`, but only when the classifier is high-confidence that the change is not
+  user-visible.
+
+Everything else is treated as missing evidence for user-visible or uncertain
+changes.
+
+### Failure behavior
+
+If the classifier cannot return valid JSON, the diff/source snippets are
+truncated beyond the configured cap, or confidence is not `high`, request
+evidence with a fixed comment. This intentionally trades false positives for
+fewer false negatives.
