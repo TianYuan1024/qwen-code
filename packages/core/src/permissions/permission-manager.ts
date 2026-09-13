@@ -1705,9 +1705,11 @@ export class PermissionManager {
       // has no session-rule removal API.
       //
       // The surviving entry must be the stashed *object*, not its fields
-      // copied onto the incumbent: `stripDangerousRulesForAutoMode` removes
-      // by identity (`sessionDangerousSet.has(r)`), so an entry that is only
-      // field-equal to the stash would be unremovable by the next strip.
+      // copied onto the incumbent: `addSessionAllowRule` sets `trustGated`
+      // only when it is true, so an ungated stash entry has no such key, and
+      // copying it across would leave an incumbent's `trustGated: true` in
+      // place — a user-level grant inheriting a project grant's trust
+      // suspension.
       const merged = [...this.sessionRules.allow];
       for (const stashed of this.strippedAllowRules.session) {
         const index = merged.findIndex((r) => r.raw === stashed.raw);

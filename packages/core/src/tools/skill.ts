@@ -39,10 +39,9 @@ import {
   ReviewWorkflowActivationError,
   collectAvailableSkillEntries,
   clearCollectedSkillEntriesCache,
+  canApplySkillSideEffects,
   skillModelInvocationBlock,
-  SKILL_LLM_CONTENT_PREFIX,
 } from './skill-utils.js';
-import { TOOL_OUTPUT_TRUNCATED_PREFIX } from './truncation.js';
 
 /**
  * Static description for the Skill tool. The live list of available skills is
@@ -113,9 +112,11 @@ const SKILL_RESTORE_REMEDIES = {
     skill.userInvocable === false
       ? 'no route re-arms it while it declares both `disable-model-invocation` and `user-invocable: false` — remove one of them'
       : `run /${skill.name} to re-apply its hooks and allowedTools — re-invoking it as a tool is refused while \`disable-model-invocation\` is set`,
+  // `/skills` is not a route for a `user-invocable: false` skill: the picker
+  // filters those out before building its toggleable list.
   enable: (skill: SkillConfig) =>
     skill.userInvocable === false
-      ? 're-enable it via /skills (or remove it from skills.disabled) and then re-invoke it — while it is disabled no route re-arms it, and it declares `user-invocable: false`, so there is no slash command either'
+      ? 'remove it from skills.disabled and then re-invoke it — while it is disabled no route re-arms it, and it declares `user-invocable: false`, so it is neither listed in /skills nor has a slash command'
       : `re-enable it via /skills (or remove it from skills.disabled) and then run /${skill.name} to re-apply its hooks and allowedTools — while it is disabled no route re-arms it, the slash command included`,
 } as const;
 
@@ -147,6 +148,27 @@ const SKILL_RESTORE_DECLINED_REASONS: Record<
   // call can ask for.
   hidden: { reason: 'it is hidden from model invocation', remedy: 'unhide' },
 };
+
+/**
+ * Whether a recorded Skill tool response is one of the strings `execute()`
+ * returns in place of a body: the dedup confirmation and its refusals. Each
+ * embeds the name exactly as requested, so the match is anchored on it at
+ * position 0 and a body that merely quotes one of these phrases is not
+ * mistaken for it. Validation refusals never reach here — the scheduler
+ * records those under `error`, not `output`.
+ */
+function isSkillNonBodyResponse(
+  requestedName: string,
+  output: string,
+): boolean {
+  const subject = `Skill "${requestedName}"`;
+  return (
+    output.startsWith(`${subject} is already loaded in context.`) ||
+    output.startsWith(`${subject} is disabled.`) ||
+    output.startsWith(`${subject} not found.`) ||
+    output.startsWith(`Failed to load skill "${requestedName}": `)
+  );
+}
 
 /**
  * Skill tool that enables the model to access skill definitions. The tool keeps
@@ -447,6 +469,11 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
       }
     }
 
+    // Exact names, the way the live path resolves a skill
+    // (`findSkillByNameAtLevel` compares `skill.name === name`). A case-folded
+    // key would collapse `deploy` and `Deploy` — both legal, and both kept by
+    // `collectCachedSkills` — into whichever sorts last, binding a recorded
+    // invocation to the other skill's side effects.
     const skillByName = new Map<
       string,
       { name: string; output: string; config: SkillConfig }
@@ -456,20 +483,15 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
         path.dirname(skill.filePath),
         skill.body,
       );
-      skillByName.set(skill.name.toLowerCase(), {
-        name: skill.name,
-        output,
-        config: skill,
-      });
+      skillByName.set(skill.name, { name: skill.name, output, config: skill });
     }
     // Pre-rename transcripts request the authored spelling; fall back to it
     // only where no skill owns that name outright, or a resumed session
     // misses the restore and re-injects a body on the next invocation.
     for (const skill of cachedSkills ?? []) {
-      const authored = (skill.authoredName ?? '').trim().toLowerCase();
-      const registryName = skill.name.toLowerCase();
-      if (authored && authored !== registryName && !skillByName.has(authored)) {
-        skillByName.set(authored, skillByName.get(registryName)!);
+      const authored = (skill.authoredName ?? '').trim();
+      if (authored && authored !== skill.name && !skillByName.has(authored)) {
+        skillByName.set(authored, skillByName.get(skill.name)!);
       }
     }
 
@@ -489,7 +511,7 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
       if (typeof requestedName !== 'string' || typeof output !== 'string') {
         return;
       }
-      const skill = skillByName.get(requestedName.toLowerCase());
+      const skill = skillByName.get(requestedName);
       if (!skill) {
         // The skill was invoked in the recorded session but no longer
         // exists on disk (deleted, renamed, or its level disabled).
@@ -512,7 +534,11 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
         // the side effects are restored. This branch used to be a bare
         // `continue`; the silence is part of what made #11180 present as a
         // working setup.
-        const entry = this.classifyUnmatchedSkillRecord(output, skill.config);
+        const entry = this.classifyUnmatchedSkillRecord(
+          requestedName,
+          output,
+          skill.config,
+        );
         // Rank, not last-write-wins. A skill invoked twice records a body
         // and then the dedup message; if the body pair already mismatched,
         // a later `remedy: null` pair would overwrite the one entry that
@@ -632,17 +658,27 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
 
   /**
    * Says why a recorded response that is not the body on disk now was
-   * declined. Names the cause the recorded output actually supports — the
-   * tool also records refusals (`Skill "X" is disabled.`, `... not found.`),
-   * and telling an operator their SKILL.md changed when it did not sends them
-   * to diff a file that never moved.
+   * declined, and whether anything was lost with it.
+   *
+   * The default is the cautious reading: a record is treated as a body that
+   * cannot be corroborated unless it is one of the strings `execute()` emits
+   * *instead* of a body (`isSkillNonBodyResponse`). The shapes a real body
+   * can be recorded in are owned by other modules and open to growth — the
+   * truncation wrapper, the `<persisted-output>` stub, the spill-failure
+   * fallback — while the set of non-body strings is small and closed.
+   * Enumerating the wrappers instead would file every future one under "no
+   * body was ever injected", at `debug`, for a skill whose side effects
+   * `execute()` did apply. Getting a non-body string wrong in this direction
+   * costs a spurious `warn`, never a silently lost gate.
+   *
+   * An uncorroborated body is still not re-armed: re-arming would grant
+   * whatever the *current* frontmatter declares on the strength of a record
+   * that cannot be compared against it.
    *
    * The compared string embeds the skill's base directory and a shared
-   * boilerplate line as well as the body, so a body-shaped record can also
-   * differ because the skill directory now resolves elsewhere (a moved
-   * checkout, a symlinked home, a session recorded inside the sandbox and
-   * resumed on the host). The reason says so rather than sending the operator
-   * to diff a file that never changed.
+   * boilerplate line as well as the body, so a body can also differ because
+   * the skill directory now resolves elsewhere (a moved checkout, a symlinked
+   * home, a session recorded inside the sandbox and resumed on the host).
    *
    * The remedy is not `reinvoke` unconditionally: a block condition can
    * co-exist with a mismatch, and then re-invoking is refused by
@@ -654,50 +690,31 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
    * off `SkillTool`'s async-committed snapshots.
    */
   private classifyUnmatchedSkillRecord(
+    requestedName: string,
     output: string,
     skill: SkillConfig,
   ): { skill: SkillConfig; reason: string; remedy: SkillRestoreRemedy | null } {
+    if (isSkillNonBodyResponse(requestedName, output)) {
+      return {
+        skill,
+        reason: "the recorded tool response is not this skill's body",
+        remedy: null,
+      };
+    }
     const blocked = skillModelInvocationBlock(
       this.config,
       this.skillManager,
       skill,
     );
-    const mismatchRemedy: SkillRestoreRemedy = blocked
-      ? SKILL_RESTORE_DECLINED_REASONS[blocked].remedy
-      : 'reinvoke';
-    if (output.startsWith(TOOL_OUTPUT_TRUNCATED_PREFIX)) {
-      // A body that *was* injected, then truncated for the model on the way
-      // into the record: `SkillTool` declares no `maxOutputChars`, so a skill
-      // over the global budgets is recorded as the truncation wrapper, which
-      // carries the body's own prefix inside the preview rather than at
-      // position 0. The side effects are still not re-applied: the record can
-      // no longer be byte-compared against SKILL.md, and re-arming from it
-      // would grant whatever the *current* frontmatter declares on the
-      // strength of a record that cannot corroborate it.
-      return {
-        skill,
-        reason:
-          'its recorded body was truncated for the model, so it ' +
-          'cannot be compared against SKILL.md on disk',
-        remedy: mismatchRemedy,
-      };
-    }
-    if (output.startsWith(SKILL_LLM_CONTENT_PREFIX)) {
-      return {
-        skill,
-        reason:
-          'its recorded body no longer matches SKILL.md on disk, ' +
-          'or its skill directory now resolves to a different path',
-        remedy: mismatchRemedy,
-      };
-    }
     return {
       skill,
-      reason: "the recorded tool response is not this skill's body",
-      // A refusal, not a body: no body was ever injected for this pair, so
-      // nothing this skill declares was armed in the recorded session either
-      // and nothing has been lost.
-      remedy: null,
+      reason:
+        'its recorded body does not match SKILL.md on disk (the file ' +
+        'changed, its skill directory now resolves to a different path, or ' +
+        'the body was truncated or saved to a file for the model)',
+      remedy: blocked
+        ? SKILL_RESTORE_DECLINED_REASONS[blocked].remedy
+        : 'reinvoke',
     };
   }
 
@@ -793,11 +810,14 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
    * #11180 still open, and promoting a message from `debug` to `warn` does
    * not close it.
    *
-   * A `null` remedy means the recorded response was not a body at all, so no
-   * body was injected and nothing was ever armed. That is `debug` regardless
-   * of what the skill declares: there is no gate to have lost, and warning
-   * about one would be the phantom failure the emptiness check below exists
-   * to avoid, repeated on every resume of that session.
+   * A `null` remedy means the recorded response is one `execute()` emits in
+   * place of a body, so that record carries nothing to re-arm. That is
+   * `debug` regardless of what the skill declares.
+   *
+   * A project skill in an untrusted folder has no working route until trust
+   * is granted — `applySkillSideEffects` refuses it on every path, the slash
+   * command included — so the remedy leads with that precondition, checked
+   * with the same predicate the enforcement path uses.
    */
   private logSkillNotRestored(
     skill: SkillConfig,
@@ -807,14 +827,19 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
     const head = `Not restoring skill "${skill.name}" on resume: ${reason}.`;
     if (remedy === null) {
       debugLogger.debug(
-        `${head} No body was injected for it by that response, so nothing ` +
-          `it declares was armed in the recorded session either.`,
+        `${head} That response carries no body for it, so there is ` +
+          `nothing to re-arm from it.`,
       );
       return;
     }
+    const route = SKILL_RESTORE_REMEDIES[remedy](skill);
     const message =
       `${head} Its instructions may still be in the replayed conversation; ` +
-      `${SKILL_RESTORE_REMEDIES[remedy](skill)}.`;
+      (canApplySkillSideEffects(skill, this.config)
+        ? `${route}.`
+        : `until this folder is trusted nothing re-arms a project skill's ` +
+          `hooks or allowedTools, the slash command included; once it is, ` +
+          `${route}.`);
     // Emptiness, not truthiness, exactly as `applySkillHooks` tests it: `{}`
     // is truthy, and the parser assigns one for `hooks: {}` and for a block
     // whose event names are all unknown. Such a skill promised no gate, so a

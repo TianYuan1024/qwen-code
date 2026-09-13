@@ -3227,6 +3227,38 @@ describe('PermissionManager', () => {
       expect(await pm.evaluate(call)).toBe('allow');
     });
 
+    it("a stashed grant re-pointed across a session takes the arriving grant's trust gating", async () => {
+      // The narrowing half of the rule above, on the stash path: a project
+      // skill's gated grant arriving in session B must not keep session A's
+      // ungated flag, or an untrusted folder keeps auto-approving a rule B
+      // only ever received from repository-controlled configuration. The raw
+      // has to stay dangerous, or the add skips the stash entirely.
+      let trusted = true;
+      let sessionId = 'session-A';
+      pm = new PermissionManager(
+        makeConfig({
+          isTrustedFolder: () => trusted,
+          getSessionId: () => sessionId,
+        }),
+      );
+      pm.initialize();
+      const call = { toolName: 'run_shell_command', command: 'npm test' };
+
+      pm.stripDangerousRulesForAutoMode();
+      pm.addSessionAllowRule('Bash(npm *)', { sessionId: 'session-A' });
+      sessionId = 'session-B';
+      pm.addSessionAllowRule('Bash(npm *)', {
+        trustGated: true,
+        sessionId: 'session-B',
+      });
+      expect(pm.getStrippedDangerousRules()?.session).toHaveLength(1);
+      pm.restoreDangerousRules();
+
+      expect(await pm.evaluate(call)).toBe('allow');
+      trusted = false;
+      expect(await pm.evaluate(call)).toBe('ask');
+    });
+
     it("a dead session's grant is absent from telemetry and from the AUTO strip", async () => {
       // `sessionRules.allow` deliberately keeps inert entries, so every reader
       // of the raw array would otherwise report a previous session's grants as
@@ -3305,13 +3337,48 @@ describe('PermissionManager', () => {
       sessionId = 'session-B';
       pm.stripDangerousRulesForAutoMode();
       pm.addSessionAllowRule('Bash(npm *)', { sessionId: 'session-B' });
+      const stashed = pm.getStrippedDangerousRules()!.session[0]!;
       pm.restoreDangerousRules();
 
       const store = (
         pm as unknown as { sessionRules: { allow: Array<{ raw: string }> } }
       ).sessionRules.allow;
       expect(store.filter((r) => r.raw === 'Bash(npm *)')).toHaveLength(1);
+      // The stashed object itself, not its fields copied onto the incumbent.
+      expect(store.find((r) => r.raw === 'Bash(npm *)')).toBe(stashed);
       expect(pm.getAllowRawStrings()).toEqual(['Bash(npm *)']);
+    });
+
+    it("re-attaching an ungated stash entry drops the incumbent's trust gating", async () => {
+      // Why the merge seats the stashed object: an ungated entry has no
+      // `trustGated` key, so copying its fields onto a gated incumbent left
+      // by a previous session would keep the gate, and the user-level grant
+      // would be suspended the moment trust is revoked.
+      let trusted = true;
+      let sessionId = 'session-A';
+      pm = new PermissionManager(
+        makeConfig({
+          isTrustedFolder: () => trusted,
+          getSessionId: () => sessionId,
+        }),
+      );
+      pm.initialize();
+      const call = { toolName: 'run_shell_command', command: 'npm test' };
+
+      pm.stripDangerousRulesForAutoMode();
+      pm.addSessionAllowRule('Bash(npm *)', {
+        trustGated: true,
+        sessionId: 'session-A',
+      });
+      pm.restoreDangerousRules();
+
+      sessionId = 'session-B';
+      pm.stripDangerousRulesForAutoMode();
+      pm.addSessionAllowRule('Bash(npm *)', { sessionId: 'session-B' });
+      pm.restoreDangerousRules();
+
+      trusted = false;
+      expect(await pm.evaluate(call)).toBe('allow');
     });
 
     it("a cross-session re-point takes the arriving grant's trust gating instead of widening", async () => {

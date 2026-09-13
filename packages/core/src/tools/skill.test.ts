@@ -8,6 +8,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { logSkillLaunch, recordSkillInvocation } from '../telemetry/index.js';
 import { SkillTool, type SkillParams } from './skill.js';
 import type { Content, PartListUnion } from '@google/genai';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'path';
 import type { ToolResultDisplay } from './tools.js';
 import type { Config } from '../config/config.js';
@@ -21,7 +23,10 @@ import {
   clearCollectedSkillEntriesCache,
   renderAvailableSkillsBlock,
 } from './skill-utils.js';
-import { TOOL_OUTPUT_TRUNCATED_PREFIX } from './truncation.js';
+import {
+  persistAndTruncateToolResult,
+  truncateAndSaveToFile,
+} from './truncation.js';
 import { recordAutoSkillUsage } from '../skills/skill-curator.js';
 import { registerSkillHooks } from '../hooks/registerSkillHooks.js';
 import { ToolNames } from './tool-names.js';
@@ -1725,7 +1730,14 @@ describe('SkillTool', () => {
         // prefix, so it cannot be satisfied by a differently-caused message.
         expect(mockDebugLogger.warn).toHaveBeenCalledWith(
           expect.stringContaining(
-            'its recorded body no longer matches SKILL.md on disk',
+            'its recorded body does not match SKILL.md on disk',
+          ),
+        );
+        // Nothing blocks this skill, so re-invoking it is the route that
+        // works; pinned positively, since every other remedy has a test.
+        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            're-invoke the skill to re-apply its hooks and allowedTools',
           ),
         );
       });
@@ -1765,46 +1777,152 @@ describe('SkillTool', () => {
         );
       });
 
-      it('does not claim nothing was armed when the recorded body was truncated', async () => {
-        // `SkillTool` declares no `maxOutputChars`, so a skill body over the
-        // global truncation budgets is recorded as the wrapper, which starts
-        // with the truncation sentinel and carries the body's own prefix
-        // inside the preview. Classifying that as "not this skill's body"
-        // files it at `debug` under a sentence asserting no body was injected
-        // and nothing was armed — both false, since `execute()` applied the
-        // side effects before returning. The decline itself still stands: the
-        // record can no longer be compared against SKILL.md.
-        const truncated: Content[] = [
-          resumedHistory(gatedSkill)[0],
-          {
-            role: 'user',
-            parts: [
+      describe('a body recorded in a shape other than verbatim', () => {
+        // `SkillTool` declares no `maxOutputChars`, so a body over the global
+        // budgets reaches the record through wrappers other modules own: the
+        // `<persisted-output>` stub, the budget-exhausted stub, the
+        // truncation wrapper, and the spill-failure fallback. `execute()`
+        // applied the side effects before any of them ran, so filing one as
+        // "not this skill's body" at `debug` would hide a lost gate. The
+        // records come from the real producers, not hand-built strings, so a
+        // new wrapper shape cannot slip past on a stale fixture.
+        const largeSkill: SkillConfig = {
+          ...gatedSkill,
+          body: 'Run the gate before every shell call.\n'.repeat(400),
+        };
+        const injected = () =>
+          buildSkillLlmContent(
+            path.dirname(largeSkill.filePath),
+            largeSkill.body,
+          );
+        let tmp: string;
+
+        beforeEach(async () => {
+          tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'skill-restore-'));
+          vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
+            largeSkill,
+          ]);
+        });
+
+        afterEach(async () => {
+          await fs.rm(tmp, { recursive: true, force: true });
+        });
+
+        const persistConfig = (bytesWritten: number) =>
+          ({
+            getToolResultBytesWritten: () => bytesWritten,
+            trackToolResultBytes: () => {},
+            storage: { getToolResultsDir: () => tmp },
+          }) as unknown as Config;
+        // A directory that cannot be created, so the spill write fails.
+        const unwritableDir = async () => {
+          const blocker = path.join(tmp, 'blocker');
+          await fs.writeFile(blocker, '');
+          return path.join(blocker, 'sub');
+        };
+
+        it.each<[string, () => Promise<string>]>([
+          [
+            'the <persisted-output> stub',
+            async () =>
+              (
+                await persistAndTruncateToolResult(
+                  'skill-call',
+                  ToolNames.SKILL,
+                  injected(),
+                  persistConfig(0),
+                )
+              ).content,
+          ],
+          [
+            'the budget-exhausted stub',
+            async () =>
+              (
+                await persistAndTruncateToolResult(
+                  'skill-call',
+                  ToolNames.SKILL,
+                  injected(),
+                  persistConfig(Number.MAX_SAFE_INTEGER),
+                )
+              ).content,
+          ],
+          [
+            'the truncation wrapper',
+            async () =>
+              (await truncateAndSaveToFile(injected(), 'skill', tmp, 1000, 20))
+                .content,
+          ],
+          [
+            'the spill-failure fallback keeping both ends',
+            async () =>
+              (
+                await truncateAndSaveToFile(
+                  injected(),
+                  'skill',
+                  await unwritableDir(),
+                  1000,
+                  20,
+                  'both',
+                )
+              ).content,
+          ],
+          [
+            'the spill-failure fallback keeping the tail',
+            async () =>
+              (
+                await truncateAndSaveToFile(
+                  injected(),
+                  'skill',
+                  await unwritableDir(),
+                  1000,
+                  20,
+                  'tail',
+                )
+              ).content,
+          ],
+        ])(
+          'declines to re-arm, and reports the lost gate, for %s',
+          async (_shape, produce) => {
+            const recorded = await produce();
+            expect(recorded.startsWith(injected())).toBe(false);
+            mockDebugLogger.warn.mockClear();
+            mockDebugLogger.debug.mockClear();
+
+            await skillTool.restoreLoadedSkillsFromHistory([
+              resumedHistory(largeSkill)[0],
               {
-                functionResponse: {
-                  id: 'skill-call',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output:
-                      `${TOOL_OUTPUT_TRUNCATED_PREFIX}.\nThe full output has ` +
-                      `been saved to: /tmp/x.output\n\n` +
-                      buildSkillLlmContent(
-                        path.dirname(gatedSkill.filePath),
-                        gatedSkill.body,
-                      ).slice(0, 200),
+                role: 'user',
+                parts: [
+                  {
+                    functionResponse: {
+                      id: 'skill-call',
+                      name: ToolNames.SKILL,
+                      response: { output: recorded },
+                    },
                   },
-                },
+                ],
               },
-            ],
+            ]);
+
+            // Withheld: the record cannot be compared against SKILL.md, so
+            // re-arming would grant whatever the current frontmatter declares
+            // on the strength of a record that cannot corroborate it.
+            expect(registerSkillHooks).not.toHaveBeenCalled();
+            expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
+            // Reported as a lost gate, with a route, not as a record that
+            // never carried a body.
+            expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+              expect.stringContaining(
+                'its recorded body does not match SKILL.md on disk',
+              ),
+            );
+            expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+              expect.stringContaining('re-invoke the skill'),
+            );
+            expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
+              expect.stringContaining("is not this skill's body"),
+            );
           },
-        ];
-
-        await skillTool.restoreLoadedSkillsFromHistory(truncated);
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('its recorded body was truncated'),
-        );
-        expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
-          expect.stringContaining("is not this skill's body"),
         );
       });
 
@@ -1865,7 +1983,71 @@ describe('SkillTool', () => {
         await skillTool.restoreLoadedSkillsFromHistory(staleThenDedup);
 
         expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('no longer matches SKILL.md on disk'),
+          expect.stringContaining('does not match SKILL.md on disk'),
+        );
+      });
+
+      it('lets a later body-shaped decline displace an earlier refusal', async () => {
+        // The other ordering of the rank above. A skill refused while it was
+        // disabled, then re-enabled and invoked (so a body was injected), then
+        // edited before resume. First-write-wins would keep the refusal and
+        // log at `debug` that the record carries no body, hiding the gate the
+        // second pair armed.
+        const [call] = resumedHistory(gatedSkill);
+        const refusalThenStale: Content[] = [
+          call,
+          {
+            role: 'user',
+            parts: [
+              {
+                functionResponse: {
+                  id: 'skill-call',
+                  name: ToolNames.SKILL,
+                  response: {
+                    output: `Skill "${gatedSkill.name}" is disabled. Re-enable it via /skills or remove it from skills.disabled.`,
+                  },
+                },
+              },
+            ],
+          },
+          {
+            role: 'model',
+            parts: [
+              {
+                functionCall: {
+                  id: 'skill-call-2',
+                  name: ToolNames.SKILL,
+                  args: { skill: gatedSkill.name },
+                },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            parts: [
+              {
+                functionResponse: {
+                  id: 'skill-call-2',
+                  name: ToolNames.SKILL,
+                  response: {
+                    output: buildSkillLlmContent(
+                      '/somewhere/else/gated-skill',
+                      'A body that no longer matches.',
+                    ),
+                  },
+                },
+              },
+            ],
+          },
+        ];
+
+        await skillTool.restoreLoadedSkillsFromHistory(refusalThenStale);
+
+        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+          expect.stringContaining('does not match SKILL.md on disk'),
+        );
+        expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
+          expect.stringContaining("is not this skill's body"),
         );
       });
 
@@ -1928,6 +2110,124 @@ describe('SkillTool', () => {
         );
         expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
           expect.stringContaining('run /gated-skill'),
+        );
+      });
+
+      it('names no route for a Skill hidden from the model and from the user', async () => {
+        const unreachable: SkillConfig = {
+          ...gatedSkill,
+          disableModelInvocation: true,
+          userInvocable: false,
+        };
+        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
+          unreachable,
+        ]);
+
+        await skillTool.restoreLoadedSkillsFromHistory(
+          resumedHistory(unreachable),
+        );
+
+        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+          expect.stringContaining('no route re-arms it'),
+        );
+        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining('run /gated-skill'),
+        );
+      });
+
+      it('does not send a disabled user-invocable: false Skill to /skills', async () => {
+        // The `/skills` picker filters out `user-invocable: false` skills
+        // before building its toggleable list, so the settings key is the
+        // only way to re-enable one.
+        const modelOnly: SkillConfig = { ...gatedSkill, userInvocable: false };
+        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
+          modelOnly,
+        ]);
+        vi.mocked(config.isSkillEnabled).mockReturnValue(false);
+
+        await skillTool.restoreLoadedSkillsFromHistory(
+          resumedHistory(modelOnly),
+        );
+
+        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'remove it from skills.disabled and then re-invoke it',
+          ),
+        );
+        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining('re-enable it via /skills'),
+        );
+        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining('run /gated-skill'),
+        );
+      });
+
+      it('names folder trust as the precondition for a project Skill in an untrusted folder', async () => {
+        // Every route — the slash command included — goes through the same
+        // trust gate in `applySkillSideEffects`, so "run /gated-skill" alone
+        // would arm nothing. Declined here before that gate is ever reached,
+        // so this line is the only one the operator gets.
+        const projectSkill: SkillConfig = {
+          ...gatedSkill,
+          level: 'project',
+          filePath: '/project/.qwen/skills/gated-skill/SKILL.md',
+          skillRoot: '/project/.qwen/skills/gated-skill',
+        };
+        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
+          projectSkill,
+        ]);
+        vi.mocked(config.isTrustedFolder).mockReturnValue(false);
+        vi.mocked(mockSkillManager.isSkillActive).mockReturnValue(false);
+
+        await skillTool.restoreLoadedSkillsFromHistory(
+          resumedHistory(projectSkill),
+        );
+
+        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            "until this folder is trusted nothing re-arms a project skill's hooks or allowedTools",
+          ),
+        );
+      });
+
+      it('binds a recorded invocation to the exactly-named Skill when names differ only by case', async () => {
+        // Both spellings are legal and both survive `collectCachedSkills`,
+        // which dedups by exact name. A case-folded lookup would bind the
+        // project `deploy` pair to the user `Deploy` entry and decline it.
+        const projectDeploy: SkillConfig = {
+          ...gatedSkill,
+          name: 'deploy',
+          level: 'project',
+          filePath: '/project/.qwen/skills/deploy/SKILL.md',
+          skillRoot: '/project/.qwen/skills/deploy',
+          allowedTools: ['Bash(npm *)'],
+          hooks: undefined,
+        };
+        const userDeploy: SkillConfig = {
+          ...gatedSkill,
+          name: 'Deploy',
+          filePath: '/home/user/.qwen/skills/Deploy/SKILL.md',
+          skillRoot: '/home/user/.qwen/skills/Deploy',
+          allowedTools: undefined,
+          hooks: undefined,
+        };
+        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
+          projectDeploy,
+          userDeploy,
+        ]);
+
+        await skillTool.restoreLoadedSkillsFromHistory(
+          resumedHistory(projectDeploy),
+        );
+
+        expect(skillTool.getLoadedSkillNames()).toEqual(new Set(['deploy']));
+        expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Bash(npm *)', {
+          trustGated: true,
+          sessionId: 'test-session-id',
+        });
+        expect(mockDebugLogger.warn).not.toHaveBeenCalled();
+        expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
+          expect.stringContaining('Not restoring skill'),
         );
       });
 
@@ -2163,40 +2463,46 @@ describe('SkillTool', () => {
         );
       });
 
-      it('does not warn about a lost gate when the recorded response was a refusal', async () => {
-        // The recorded pair is a refusal, not a body — the tool records those
-        // as a plain output string too. No body was ever injected and no gate
-        // was ever armed, so "its instructions may still be in the replayed
-        // conversation" is false for this record, and warning would repeat on
-        // every resume of that session.
-        const refusalHistory: Content[] = [
-          resumedHistory(gatedSkill)[0],
-          {
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: `Skill "${gatedSkill.name}" is disabled. Re-enable it via /skills or remove it from skills.disabled.`,
+      it.each([
+        'Skill "gated-skill" is disabled. Re-enable it via /skills or remove it from skills.disabled.',
+        'Skill "gated-skill" not found.',
+        'Skill "gated-skill" is already loaded in context.',
+        'Failed to load skill "gated-skill": EACCES',
+      ])(
+        'does not warn about a lost gate when the recorded response carries no body: %s',
+        async (output) => {
+          // These are the strings `execute()` returns in place of a body, so
+          // the record carries nothing to re-arm and warning would repeat on
+          // every resume of that session. `remedy: null` is safe only for
+          // this closed set — any other unmatched record is read as a body
+          // that cannot be corroborated (see the wrapper cases above).
+          const refusalHistory: Content[] = [
+            resumedHistory(gatedSkill)[0],
+            {
+              role: 'user',
+              parts: [
+                {
+                  functionResponse: {
+                    id: 'skill-call',
+                    name: ToolNames.SKILL,
+                    response: { output },
                   },
                 },
-              },
-            ],
-          },
-        ];
+              ],
+            },
+          ];
 
-        await skillTool.restoreLoadedSkillsFromHistory(refusalHistory);
+          await skillTool.restoreLoadedSkillsFromHistory(refusalHistory);
 
-        expect(skillTool.getLoadedSkillNames()).toEqual(new Set());
-        expect(mockDebugLogger.warn).not.toHaveBeenCalled();
-        expect(mockDebugLogger.debug).toHaveBeenCalledWith(
-          expect.stringContaining(
-            "the recorded tool response is not this skill's body",
-          ),
-        );
-      });
+          expect(skillTool.getLoadedSkillNames()).toEqual(new Set());
+          expect(mockDebugLogger.warn).not.toHaveBeenCalled();
+          expect(mockDebugLogger.debug).toHaveBeenCalledWith(
+            expect.stringContaining(
+              "the recorded tool response is not this skill's body. That response carries no body for it",
+            ),
+          );
+        },
+      );
 
       it('does not warn when a later pair restores the Skill an earlier one declined', async () => {
         // The loop walks pairs, but the warning is about the session, so it

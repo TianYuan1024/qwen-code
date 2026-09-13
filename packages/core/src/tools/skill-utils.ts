@@ -17,13 +17,6 @@ import { createDebugLogger } from '../utils/debugLogger.js';
 const debugLogger = createDebugLogger('SKILL');
 
 /**
- * The first bytes of every injected skill body. Exported so a recorded tool
- * response can be told apart from the other strings the Skill tool records —
- * its dedup message and its refusals — without inventing a second contract.
- */
-export const SKILL_LLM_CONTENT_PREFIX = 'Base directory for this skill: ';
-
-/**
  * Why the model cannot invoke a skill right now, or `undefined` when it can.
  *
  * The single source of truth for the model-facing availability rule. It is
@@ -75,7 +68,7 @@ export function skillModelInvocationBlock(
  * so that token estimates stay in sync with actual usage.
  */
 export function buildSkillLlmContent(baseDir: string, body: string): string {
-  return `${SKILL_LLM_CONTENT_PREFIX}${baseDir}\nImportant: ALWAYS resolve absolute paths from this base directory when working with skills.\n\n${body}\n`;
+  return `Base directory for this skill: ${baseDir}\nImportant: ALWAYS resolve absolute paths from this base directory when working with skills.\n\n${body}\n`;
 }
 
 /**
