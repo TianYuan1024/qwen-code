@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Config } from '../config/config.js';
@@ -23,6 +23,7 @@ import {
 } from './chatRecordingService.js';
 import { MAX_RETAINED_TOOL_RESULT_DISPLAY_CHARS } from '../utils/toolResultDisplayCompaction.js';
 import * as jsonl from '../utils/jsonl-utils.js';
+import { computeInitialTurnFromHistory } from './session-turn-state.js';
 import type { Part } from '@google/genai';
 import type { FileDiff } from '../tools/tools.js';
 import {
@@ -141,7 +142,7 @@ describe('ChatRecordingService', () => {
       parts.pop();
       return parts.join('/');
     });
-    vi.mocked(execSync).mockReturnValue('main\n');
+    vi.mocked(execFileSync).mockReturnValue('main\n');
     vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
     vi.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
     vi.spyOn(fs, 'existsSync').mockReturnValue(false);
@@ -205,7 +206,47 @@ describe('ChatRecordingService', () => {
       expect(record.version).toBe('1.0.0');
       expect(record.gitBranch).toBe('main');
       expect(record.provenance).toBe('real_user');
+      expect(record.daemonPromptId).toBeUndefined();
     });
+
+    it('persists the daemon prompt identity before any turn result', async () => {
+      chatRecordingService.recordUserMessage(
+        [{ text: 'same prompt' }],
+        undefined,
+        undefined,
+        'daemon-prompt-1',
+      );
+      await chatRecordingService.flush();
+
+      expect(jsonl.writeLine).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(jsonl.writeLine).mock.calls[0][1]).toMatchObject({
+        type: 'user',
+        daemonPromptId: 'daemon-prompt-1',
+        message: { role: 'user', parts: [{ text: 'same prompt' }] },
+      });
+    });
+
+    it.each(['42', '9007199254740992'])(
+      'keeps daemon IDs ending in ########%s out of CLI turn recovery',
+      async (turn) => {
+        const daemonPromptId = `test-session-id########${turn}`;
+        chatRecordingService.recordUserMessage(
+          [{ text: 'same prompt' }],
+          undefined,
+          undefined,
+          daemonPromptId,
+        );
+        await chatRecordingService.flush();
+
+        const record = vi.mocked(jsonl.writeLine).mock
+          .calls[0][1] as ChatRecord;
+        expect(record.daemonPromptId).toBe(daemonPromptId);
+        expect(record).not.toHaveProperty('promptId');
+        expect(computeInitialTurnFromHistory([record], 'test-session-id')).toBe(
+          1,
+        );
+      },
+    );
 
     it('preserves model-bound parts and records clean display text', async () => {
       const modelParts: Part[] = [
@@ -1480,6 +1521,24 @@ describe('ChatRecordingService', () => {
           resultCode: 'RESULT_TEXT_TRUNCATED',
         }),
       ).toBe(false);
+    });
+
+    it.each([
+      [undefined, true],
+      [1_500, true],
+      [NaN, false],
+      [Infinity, false],
+      ['1500', false],
+    ])('validates cancellation timestamp %s', (cancelledAt, valid) => {
+      expect(
+        isTurnResultRecordPayload({
+          promptId: 'prompt-1',
+          state: 'cancelled',
+          startedAt: 1_000,
+          cancelledAt,
+          endedAt: 2_000,
+        }),
+      ).toBe(valid);
     });
 
     it('caps promptId, stopReason, and originatorClientId in turn_result payloads', () => {
@@ -3121,7 +3180,7 @@ describe('ChatRecordingService', () => {
     });
 
     it('refreshes the cached git branch at the attribution turn boundary', async () => {
-      vi.mocked(execSync)
+      vi.mocked(execFileSync)
         .mockReturnValueOnce('main\n')
         .mockReturnValueOnce('feature\n');
 

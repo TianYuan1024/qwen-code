@@ -61,15 +61,21 @@ import {
 } from './artifacts/TurnOutputs';
 import { ParallelAgentsGroup } from './messages/tools/ParallelAgentsGroup';
 import { useSharedNow } from '../hooks/useSharedNow';
+import { useChatNavigationVisible } from '../hooks/useChatNavigationVisible';
 import {
   isActiveToolStatus,
+  isCompletedAskUserQuestion,
+  isAskUserQuestionToolName,
   toolContainsCallId,
 } from './messages/toolFormatting';
 import { getMcpAppDisplay } from './messages/McpApp';
 import turnCollapseStyles from './TurnCollapseRow.module.css';
 import flashStyles from './MessageLocateFlash.module.css';
 import styles from './MessageList.module.css';
-import { WEB_SHELL_TRANSCRIPT_RELOAD_BLOCKS } from '../constants/sessions';
+import {
+  SESSION_TIMELINE_MIN_VISIBLE_ENTRIES,
+  WEB_SHELL_TRANSCRIPT_RELOAD_BLOCKS,
+} from '../constants/sessions';
 import type { AttachmentPreviewRequest } from '../adapters/messageTypes';
 
 const noopTurnOutputAction = () => undefined;
@@ -92,7 +98,16 @@ export interface MessageListProps {
   onImagePreview?: (src: string, alt?: string) => void;
   onAttachmentPreview?: (file: AttachmentPreviewRequest) => void;
   onInsightReportOpen?: (path: string) => void;
-  onEditUserMessage?: (targetTurnIndex: number, content: string) => void;
+  /** Open the in-place editor; return true when a host owns the lifecycle. */
+  onEditUserMessage?: (
+    targetTurnIndex: number,
+    content: string,
+  ) => boolean | void;
+  /** Send the text confirmed in the in-place editor. `false` keeps it open. */
+  onSubmitUserMessageEdit?: (
+    targetTurnIndex: number,
+    content: string,
+  ) => boolean | void | Promise<boolean | void>;
   loadingTranscript?: boolean;
   catchingUp?: boolean;
   hasOlderHistory?: boolean;
@@ -306,7 +321,11 @@ function isForceExpandGroup(
   return false;
 }
 
-function splitMcpAppToolGroups(messages: Message[]): Message[] {
+function isStandaloneTool(tool: ACPToolCall): boolean {
+  return isCompletedAskUserQuestion(tool) || !!getMcpAppDisplay(tool.rawOutput);
+}
+
+function splitStandaloneToolGroups(messages: Message[]): Message[] {
   const result: Message[] = [];
   let changed = false;
 
@@ -314,7 +333,7 @@ function splitMcpAppToolGroups(messages: Message[]): Message[] {
     if (
       message.role !== 'tool_group' ||
       message.tools.length < 2 ||
-      !message.tools.some((tool) => getMcpAppDisplay(tool.rawOutput))
+      !message.tools.some(isStandaloneTool)
     ) {
       result.push(message);
       continue;
@@ -336,7 +355,7 @@ function splitMcpAppToolGroups(messages: Message[]): Message[] {
     };
 
     for (const tool of message.tools) {
-      if (getMcpAppDisplay(tool.rawOutput)) {
+      if (isStandaloneTool(tool)) {
         pushSegment(segment);
         segment = [];
         pushSegment([tool]);
@@ -360,7 +379,7 @@ function mergeCompactToolGroups(
   const isMergedToolGroup = (m: Message): boolean =>
     m.role === 'tool_group' &&
     !isForceExpandGroup(m, pendingApproval) &&
-    !m.tools.some((tool) => getMcpAppDisplay(tool.rawOutput));
+    !m.tools.some(isStandaloneTool);
 
   while (i < messages.length) {
     const msg = messages[i];
@@ -736,6 +755,7 @@ function isHideableStep(item: DisplayItem, isFinalAnswer: boolean): boolean {
   if (item.type === 'turn_collapse') return false;
   switch (item.message.role) {
     case 'tool_group':
+      return !item.message.tools.some(isCompletedAskUserQuestion);
     case 'plan':
       return true;
     case 'assistant':
@@ -1363,7 +1383,11 @@ function itemToolCallCount(item: DisplayItem): number {
   if (item.type === 'parallel_agents') return item.agents.length;
   if (item.type === 'turn_outputs') return 0;
   if (item.type === 'turn_collapse') return 0;
-  return item.message.role === 'tool_group' ? item.message.tools.length : 0;
+  return item.message.role === 'tool_group'
+    ? item.message.tools.filter(
+        (tool) => !isAskUserQuestionToolName(tool.toolName),
+      ).length
+    : 0;
 }
 
 /**
@@ -1926,6 +1950,7 @@ export function applyTurnCollapse(
     const answerIdx = findFinalAnswerIndex(items, start, end);
     let hiddenCount = 0;
     let terminalTs: number | undefined;
+    let cancelledElapsedMs: number | undefined;
     let assistantTs: number | undefined;
     let inputTokens = 0;
     let outputTokens = 0;
@@ -1954,6 +1979,24 @@ export function applyTurnCollapse(
       ) {
         // Compact mode folds thinking into tool summaries; count it too.
         thinkingCount += item.message.thoughts.length;
+      }
+      if (
+        item.type === 'message' &&
+        item.message.role === 'system' &&
+        item.message.source === 'prompt_cancelled'
+      ) {
+        const data = item.message.data;
+        const elapsed =
+          data && typeof data === 'object' && 'elapsedMs' in data
+            ? data.elapsedMs
+            : undefined;
+        if (
+          typeof elapsed === 'number' &&
+          Number.isFinite(elapsed) &&
+          elapsed >= 0
+        ) {
+          cancelledElapsedMs = elapsed;
+        }
       }
       const terminalTimestamp = terminalTurnTimestamp(item);
       if (terminalTimestamp !== undefined) {
@@ -1994,11 +2037,12 @@ export function applyTurnCollapse(
         : undefined;
     const lastStepTs = terminalTs ?? assistantTs;
     const elapsedMs =
-      promptTs !== undefined &&
+      cancelledElapsedMs ??
+      (promptTs !== undefined &&
       lastStepTs !== undefined &&
       lastStepTs >= promptTs
         ? lastStepTs - promptTs
-        : undefined;
+        : undefined);
     const hasMetrics =
       hasUsage || elapsedMs !== undefined || liveStartedAt !== undefined;
 
@@ -2206,7 +2250,6 @@ const FOLLOW_BOTTOM_THRESHOLD_PX = 30;
 const LOAD_OLDER_HISTORY_THRESHOLD_PX = 160;
 const OLDER_HISTORY_ANCHOR_WAIT_FRAMES = 30;
 export const VIRTUAL_SCROLL_THRESHOLD = 200;
-const SESSION_TIMELINE_MIN_VISIBLE_ENTRIES = 4;
 
 export function shouldUseVirtualScroll(
   totalCount: number,
@@ -2236,7 +2279,7 @@ type Translate = (
 ) => string;
 
 function durationMetricText(elapsedMs: number | undefined): string {
-  return elapsedMs !== undefined && elapsedMs > 0
+  return elapsedMs !== undefined && elapsedMs >= 0
     ? formatDuration(elapsedMs)
     : '';
 }
@@ -2826,6 +2869,7 @@ export const MessageList = memo(
       onAttachmentPreview,
       onInsightReportOpen,
       onEditUserMessage,
+      onSubmitUserMessageEdit,
       loadingTranscript,
       catchingUp,
       hasOlderHistory = false,
@@ -2932,14 +2976,14 @@ export const MessageList = memo(
         } else if (tail?.role === 'thinking') {
           value = compactMode
             ? updateCompactStreamingThinkingTail(cached.value, tail)
-            : splitMcpAppToolGroups(messages);
+            : splitStandaloneToolGroups(messages);
         }
       }
       if (!value) {
-        const standaloneMcpApps = splitMcpAppToolGroups(messages);
+        const standaloneTools = splitStandaloneToolGroups(messages);
         value = compactMode
-          ? mergeCompactToolGroups(standaloneMcpApps, pendingApproval)
-          : standaloneMcpApps;
+          ? mergeCompactToolGroups(standaloneTools, pendingApproval)
+          : standaloneTools;
       }
       mergedMessagesCache.current = {
         sourceMessages: messages,
@@ -3266,8 +3310,11 @@ export const MessageList = memo(
       }
       return { key: null };
     }, [backgroundSummaryGraceActive, displayItems]);
-    const [isSessionTimelineVisible, setIsSessionTimelineVisible] =
-      useState(false);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const isSessionTimelineVisible = useChatNavigationVisible(
+      containerRef,
+      !hideSessionTimeline,
+    );
     const [automaticallyExpandedAgentKeys, setAutomaticallyExpandedAgentKeys] =
       useState<ReadonlySet<string>>(() => new Set());
     const handleAutomaticAgentExpansionChange = useCallback(
@@ -3287,8 +3334,7 @@ export const MessageList = memo(
       t: typeof t;
       entries: SessionTimelineEntry[];
     } | null>(null);
-    // Signature + entries are O(transcript text); only pay for them while the
-    // rail can actually show (container >= 1160px — never on mobile).
+    // Signature + entries are O(transcript text); only pay while the rail can show.
     const sessionTimelineEntries = useMemo(() => {
       if (!isSessionTimelineVisible) return EMPTY_SESSION_TIMELINE_ENTRIES;
       const signature = getSessionTimelineSignature(mergedMessages);
@@ -3433,7 +3479,6 @@ export const MessageList = memo(
     const pendingFollowRecheckFrame = useRef<number | undefined>(undefined);
     const pendingOverflowFrame = useRef<number | undefined>(undefined);
     catchingUpRef.current = catchingUp;
-    const containerRef = useRef<HTMLDivElement>(null);
     const olderHistoryRetryBlocked = useRef(false);
     const olderHistoryAnchorFrame = useRef<number | undefined>(undefined);
     const olderHistoryAnchorWaitFrame = useRef<number | undefined>(undefined);
@@ -3755,30 +3800,6 @@ export const MessageList = memo(
 
     const hasEnoughSessionTimelineEntries =
       sessionTimelineEntries.length >= SESSION_TIMELINE_MIN_VISIBLE_ENTRIES;
-
-    useLayoutEffect(() => {
-      if (hideSessionTimeline) {
-        setIsSessionTimelineVisible((prev) => (prev ? false : prev));
-        return;
-      }
-
-      const el = containerRef.current;
-      if (!el) return;
-
-      const updateVisibility = () => {
-        const width = el.getBoundingClientRect().width;
-        const nextVisible = width >= 1160;
-        setIsSessionTimelineVisible((prev) =>
-          prev === nextVisible ? prev : nextVisible,
-        );
-      };
-
-      updateVisibility();
-      if (typeof ResizeObserver === 'undefined') return;
-      const observer = new ResizeObserver(updateVisibility);
-      observer.observe(el);
-      return () => observer.disconnect();
-    }, [hideSessionTimeline]);
 
     // ── Scroll-follow state ──────────────────────────────────────────────
     //
@@ -4118,7 +4139,7 @@ export const MessageList = memo(
       (event: ReactMouseEvent<HTMLDivElement>) => {
         const target = event.target;
         if (!(target instanceof HTMLElement)) return;
-        if (!target.closest('[aria-expanded]')) return;
+        if (!target.closest('[aria-expanded], summary')) return;
         followPausedByUserRef.current = true;
         setShouldFollow(false);
         scheduleFollowRecheck();
@@ -5460,6 +5481,22 @@ export const MessageList = memo(
             displayItem.message.role === 'user'
               ? displayItem.message.content
               : undefined;
+          // Only the newest user turn can be edited, and only while the
+          // transcript still holds the turn the rewind would target.
+          const userMessageEditTarget =
+            editableUserContent !== undefined &&
+            displayItem.message.id === editableUserTurn.lastId &&
+            !isResponding &&
+            !hasOlderHistory &&
+            !historyCapacityReached
+              ? {
+                  turnIndex:
+                    editableUserTurn.turnIndexById.get(
+                      displayItem.message.id,
+                    ) ?? 0,
+                  content: editableUserContent,
+                }
+              : undefined;
 
           return (
             <MessageItem
@@ -5470,19 +5507,20 @@ export const MessageList = memo(
               onAttachmentPreview={onAttachmentPreview}
               onInsightReportOpen={onInsightReportOpen}
               onEditUserMessage={
-                onEditUserMessage &&
-                !isResponding &&
-                !hasOlderHistory &&
-                !historyCapacityReached &&
-                displayItem.message.role === 'user' &&
-                editableUserContent !== undefined &&
-                displayItem.message.id === editableUserTurn.lastId
+                onEditUserMessage && userMessageEditTarget
                   ? () =>
                       onEditUserMessage(
-                        editableUserTurn.turnIndexById.get(
-                          displayItem.message.id,
-                        ) ?? 0,
-                        editableUserContent,
+                        userMessageEditTarget.turnIndex,
+                        userMessageEditTarget.content,
+                      )
+                  : undefined
+              }
+              onSubmitUserMessageEdit={
+                onSubmitUserMessageEdit && userMessageEditTarget
+                  ? (content) =>
+                      onSubmitUserMessageEdit(
+                        userMessageEditTarget.turnIndex,
+                        content,
                       )
                   : undefined
               }
@@ -5548,6 +5586,7 @@ export const MessageList = memo(
         onAttachmentPreview,
         onInsightReportOpen,
         onEditUserMessage,
+        onSubmitUserMessageEdit,
         editableUserTurn,
         hasOlderHistory,
         historyCapacityReached,

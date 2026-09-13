@@ -36,6 +36,7 @@ export { buildSkillLlmContent } from './skill-utils.js';
 import {
   buildSkillLlmContent,
   applySkillSideEffects,
+  ReviewWorkflowActivationError,
   collectAvailableSkillEntries,
   clearCollectedSkillEntriesCache,
   skillModelInvocationBlock,
@@ -60,14 +61,16 @@ When users ask you to perform tasks, check if any of the available skills can he
 
 How to invoke:
 - Use this tool with the skill name only (no arguments)
+- Name the skill exactly as it appears in the available-skills listing; do not shorten or guess a spelling.
 - Examples:
   - \`skill: "pdf"\` - invoke the pdf skill
   - \`skill: "xlsx"\` - invoke the xlsx skill
-  - \`skill: "ms-office-suite:pdf"\` - invoke using fully qualified name
+  - \`skill: "ms-office-suite:pdf"\` - invoke the pdf skill owned by the ms-office-suite extension
   - \`skill: "mcp-prompt", args: "topic"\` - invoke a model-invocable command with arguments
 
 Important:
 - Available skills are listed in <system-reminder> messages in the conversation; only use skills listed there.
+- A skill provided by an extension is registered as \`<extensionName>:<skillName>\` (e.g. \`ms-office-suite:pdf\`), so two extensions offering the same authored name are two different skills. Personal, project, and bundled skills keep the single name their author wrote and are never prefixed.
 - When a skill is relevant, you must invoke this tool IMMEDIATELY as your first action
 - NEVER just announce or mention a skill in your text response without actually calling this tool
 - This is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task
@@ -459,8 +462,17 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
         config: skill,
       });
     }
+    // Pre-rename transcripts request the authored spelling; fall back to it
+    // only where no skill owns that name outright, or a resumed session
+    // misses the restore and re-injects a body on the next invocation.
+    for (const skill of cachedSkills ?? []) {
+      const authored = (skill.authoredName ?? '').trim().toLowerCase();
+      const registryName = skill.name.toLowerCase();
+      if (authored && authored !== registryName && !skillByName.has(authored)) {
+        skillByName.set(authored, skillByName.get(registryName)!);
+      }
+    }
 
-    const pendingSkillCalls = new Map<string, string>();
     // Declines are collected and logged after the scan, not inline. The loop
     // walks history pairs, and a skill's first recorded pair can be a refusal
     // (or a body from a stale path) while a later pair is the real body that
@@ -471,9 +483,68 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
       string,
       { skill: SkillConfig; reason: string; remedy: SkillRestoreRemedy | null }
     >();
+    const restored: SkillConfig[] = [];
+
+    const restoreSkill = (requestedName: unknown, output: unknown): void => {
+      if (typeof requestedName !== 'string' || typeof output !== 'string') {
+        return;
+      }
+      const skill = skillByName.get(requestedName.toLowerCase());
+      if (!skill) {
+        // The skill was invoked in the recorded session but no longer
+        // exists on disk (deleted, renamed, or its level disabled).
+        debugLogger.debug(
+          `Skill "${requestedName}" appears in the resumed history but is not in the current skill cache; not restoring it.`,
+        );
+        return;
+      }
+      if (this.loadedSkillNames.has(skill.name)) {
+        // An earlier pair in this same history already restored this skill.
+        // What follows is a same-session re-invocation, whose recorded
+        // output is the dedup message rather than a body — matching it
+        // against the file would blame `SKILL.md` for a skill that is
+        // already armed. Nothing left to do for it either way.
+        return;
+      }
+      if (output !== skill.output && !output.startsWith(`${skill.output}\n`)) {
+        // The recorded output is not the body on disk now, so it cannot be
+        // attributed to the current file: neither the dedup bookkeeping nor
+        // the side effects are restored. This branch used to be a bare
+        // `continue`; the silence is part of what made #11180 present as a
+        // working setup.
+        const entry = this.classifyUnmatchedSkillRecord(output, skill.config);
+        // Rank, not last-write-wins. A skill invoked twice records a body
+        // and then the dedup message; if the body pair already mismatched,
+        // a later `remedy: null` pair would overwrite the one entry that
+        // reports a genuinely lost gate, downgrading its `warn` to `debug`
+        // and discarding the only actionable route. A refusal still wins
+        // when it is the only thing recorded for that skill.
+        const previous = declined.get(skill.name);
+        const outranked =
+          previous !== undefined &&
+          previous.remedy !== null &&
+          entry.remedy === null;
+        if (!outranked) {
+          declined.set(skill.name, entry);
+        }
+        return;
+      }
+
+      // Bookkeeping is unconditional: the body is in the restored context
+      // regardless, and the dedup guard must know about it.
+      this.loadedSkillContents.add(skill.output);
+      this.loadedSkillNames.add(skill.name);
+      restored.push(skill.config);
+    };
+
+    const pendingSkillCalls = new Map<string, string>();
+    const pendingExecCalls = new Set<string>();
     for (const content of history) {
       for (const part of content.parts ?? []) {
         const call = part.functionCall;
+        if (call?.name === ToolNames.EXEC && typeof call.id === 'string') {
+          pendingExecCalls.add(call.id);
+        }
         const requestedSkill = call?.args?.['skill'];
         if (
           call?.name === ToolNames.SKILL &&
@@ -487,6 +558,44 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
         const response = part.functionResponse;
         const output = response?.response?.['output'];
         if (
+          response?.name === ToolNames.EXEC &&
+          typeof response.id === 'string' &&
+          pendingExecCalls.delete(response.id) &&
+          typeof output === 'string'
+        ) {
+          let payload: unknown;
+          try {
+            payload = JSON.parse(output.split('\n', 1)[0]);
+          } catch {
+            continue;
+          }
+          if (
+            !payload ||
+            typeof payload !== 'object' ||
+            !('toolResults' in payload) ||
+            !Array.isArray(payload.toolResults)
+          ) {
+            continue;
+          }
+          const results: unknown[] = payload.toolResults;
+          for (const result of results) {
+            if (
+              result &&
+              typeof result === 'object' &&
+              'name' in result &&
+              result.name === ToolNames.SKILL &&
+              'args' in result &&
+              result.args &&
+              typeof result.args === 'object' &&
+              'skill' in result.args &&
+              'output' in result
+            ) {
+              restoreSkill(result.args.skill, result.output);
+            }
+          }
+          continue;
+        }
+        if (
           response?.name !== ToolNames.SKILL ||
           typeof response.id !== 'string' ||
           typeof output !== 'string'
@@ -497,140 +606,16 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
         const requestedName = pendingSkillCalls.get(response.id);
         pendingSkillCalls.delete(response.id);
         if (requestedName === undefined) continue;
-        const skill = skillByName.get(requestedName.toLowerCase());
-        if (!skill) {
-          // The skill was invoked in the recorded session but no longer
-          // exists on disk (deleted, renamed, or its level disabled).
-          debugLogger.debug(
-            `Skill "${requestedName}" appears in the resumed history but is not in the current skill cache; not restoring it.`,
-          );
-          continue;
-        }
-        if (this.loadedSkillNames.has(skill.name)) {
-          // An earlier pair in this same history already restored this skill.
-          // What follows is a same-session re-invocation, whose recorded
-          // output is the dedup message rather than a body — matching it
-          // against the file would blame `SKILL.md` for a skill that is
-          // already armed. Nothing left to do for it either way.
-          continue;
-        }
-        if (
-          output !== skill.output &&
-          !output.startsWith(`${skill.output}\n`)
-        ) {
-          // The recorded output is not the body on disk now, so it cannot be
-          // attributed to the current file: neither the dedup bookkeeping nor
-          // the side effects are restored. This branch used to be a bare
-          // `continue`; the silence is part of what made #11180 present as a
-          // working setup. Name the cause the recorded output actually
-          // supports — the tool also records refusals (`Skill "X" is
-          // disabled.`, `... not found.`), and telling an operator their
-          // SKILL.md changed when it did not sends them to diff a file that
-          // never moved.
-          //
-          // The compared string embeds the skill's base directory and a
-          // shared boilerplate line as well as the body, so a body-shaped
-          // record can also differ because the skill directory now resolves
-          // elsewhere (a moved checkout, a symlinked home, a session recorded
-          // inside the sandbox and resumed on the host). The reason says so
-          // rather than sending the operator to diff a file that never
-          // changed.
-          //
-          // The remedy is not `reinvoke` unconditionally: a block condition
-          // can co-exist with a mismatch, and then re-invoking is refused by
-          // `validateToolParams` rather than by anything the mismatch caused.
-          // The co-occurrence is not exotic — the compared string embeds the
-          // base directory, so a moved checkout mismatches every skill, and
-          // `paths:` activation is in-memory, so a conditional skill is
-          // `inactive` by construction in a resumed process. Read live off
-          // `Config` / `SkillManager`, the same way `restoreSkillSideEffects`
-          // reads it, never off `SkillTool`'s async-committed snapshots.
-          const blocked = skillModelInvocationBlock(
-            this.config,
-            this.skillManager,
-            skill.config,
-          );
-          const mismatchRemedy: SkillRestoreRemedy = blocked
-            ? SKILL_RESTORE_DECLINED_REASONS[blocked].remedy
-            : 'reinvoke';
-
-          let entry: {
-            skill: SkillConfig;
-            reason: string;
-            remedy: SkillRestoreRemedy | null;
-          };
-          if (output.startsWith(TOOL_OUTPUT_TRUNCATED_PREFIX)) {
-            // A body that *was* injected, then truncated for the model on the
-            // way into the record: `SkillTool` declares no `maxOutputChars`,
-            // so a skill over the global budgets is recorded as the
-            // truncation wrapper, which carries the body's own prefix inside
-            // the preview rather than at position 0. Reading that as "not
-            // this skill's body" would file it at `debug` under a sentence
-            // asserting nothing was ever armed — false twice over, since
-            // `execute()` applied the side effects before returning.
-            //
-            // The side effects are still not re-applied. The record can no
-            // longer be byte-compared against SKILL.md, which is the whole
-            // check this branch performs, and re-arming from it would grant
-            // whatever the *current* frontmatter declares on the strength of
-            // a record that cannot corroborate it. So the decline stands and
-            // the reason says why, which is what makes the level `warn` for a
-            // skill that declares a side effect.
-            //
-            // `startsWith` at position 0, exactly as the idempotency guard in
-            // `truncation.ts` matches it, so a skill body that merely quotes
-            // the phrase is not mistaken for a truncated record. Both budgets
-            // are operator-overridable, so nothing here assumes a size.
-            entry = {
-              skill: skill.config,
-              reason:
-                'its recorded body was truncated for the model, so it ' +
-                'cannot be compared against SKILL.md on disk',
-              remedy: mismatchRemedy,
-            };
-          } else if (output.startsWith(SKILL_LLM_CONTENT_PREFIX)) {
-            entry = {
-              skill: skill.config,
-              reason:
-                'its recorded body no longer matches SKILL.md on disk, ' +
-                'or its skill directory now resolves to a different path',
-              remedy: mismatchRemedy,
-            };
-          } else {
-            entry = {
-              skill: skill.config,
-              reason: "the recorded tool response is not this skill's body",
-              // A refusal, not a body: no body was ever injected for this
-              // pair, so nothing this skill declares was armed in the
-              // recorded session either and nothing has been lost.
-              remedy: null,
-            };
-          }
-
-          // Rank, not last-write-wins. A skill invoked twice records a body
-          // and then the dedup message; if the body pair already mismatched,
-          // a later `remedy: null` pair would overwrite the one entry that
-          // reports a genuinely lost gate, downgrading its `warn` to `debug`
-          // and discarding the only actionable route. A refusal still wins
-          // when it is the only thing recorded for that skill.
-          const previous = declined.get(skill.name);
-          const outranked =
-            previous !== undefined &&
-            previous.remedy !== null &&
-            entry.remedy === null;
-          if (!outranked) {
-            declined.set(skill.name, entry);
-          }
-          continue;
-        }
-
-        // Bookkeeping is unconditional: the body is in the restored context
-        // regardless, and the dedup guard must know about it.
-        this.loadedSkillContents.add(skill.output);
-        this.loadedSkillNames.add(skill.name);
-
-        this.restoreSkillSideEffects(skill.config);
+        restoreSkill(requestedName, output);
       }
+    }
+
+    // Awaited before this method resolves, and the client awaits this method
+    // before the resumed session takes a turn: a grant or hook registration
+    // still in flight when the first post-resume tool call is evaluated would
+    // reopen the window #11180 is about.
+    for (const skill of restored) {
+      await this.restoreSkillSideEffects(skill);
     }
 
     // Only for skills nothing later in the history restored. A decline the
@@ -643,6 +628,77 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
       if (this.loadedSkillNames.has(name)) continue;
       this.logSkillNotRestored(entry.skill, entry.reason, entry.remedy);
     }
+  }
+
+  /**
+   * Says why a recorded response that is not the body on disk now was
+   * declined. Names the cause the recorded output actually supports — the
+   * tool also records refusals (`Skill "X" is disabled.`, `... not found.`),
+   * and telling an operator their SKILL.md changed when it did not sends them
+   * to diff a file that never moved.
+   *
+   * The compared string embeds the skill's base directory and a shared
+   * boilerplate line as well as the body, so a body-shaped record can also
+   * differ because the skill directory now resolves elsewhere (a moved
+   * checkout, a symlinked home, a session recorded inside the sandbox and
+   * resumed on the host). The reason says so rather than sending the operator
+   * to diff a file that never changed.
+   *
+   * The remedy is not `reinvoke` unconditionally: a block condition can
+   * co-exist with a mismatch, and then re-invoking is refused by
+   * `validateToolParams` rather than by anything the mismatch caused. The
+   * co-occurrence is not exotic — a moved checkout mismatches every skill,
+   * and `paths:` activation is in-memory, so a conditional skill is
+   * `inactive` by construction in a resumed process. Read live off `Config` /
+   * `SkillManager`, the same way `restoreSkillSideEffects` reads it, never
+   * off `SkillTool`'s async-committed snapshots.
+   */
+  private classifyUnmatchedSkillRecord(
+    output: string,
+    skill: SkillConfig,
+  ): { skill: SkillConfig; reason: string; remedy: SkillRestoreRemedy | null } {
+    const blocked = skillModelInvocationBlock(
+      this.config,
+      this.skillManager,
+      skill,
+    );
+    const mismatchRemedy: SkillRestoreRemedy = blocked
+      ? SKILL_RESTORE_DECLINED_REASONS[blocked].remedy
+      : 'reinvoke';
+    if (output.startsWith(TOOL_OUTPUT_TRUNCATED_PREFIX)) {
+      // A body that *was* injected, then truncated for the model on the way
+      // into the record: `SkillTool` declares no `maxOutputChars`, so a skill
+      // over the global budgets is recorded as the truncation wrapper, which
+      // carries the body's own prefix inside the preview rather than at
+      // position 0. The side effects are still not re-applied: the record can
+      // no longer be byte-compared against SKILL.md, and re-arming from it
+      // would grant whatever the *current* frontmatter declares on the
+      // strength of a record that cannot corroborate it.
+      return {
+        skill,
+        reason:
+          'its recorded body was truncated for the model, so it ' +
+          'cannot be compared against SKILL.md on disk',
+        remedy: mismatchRemedy,
+      };
+    }
+    if (output.startsWith(SKILL_LLM_CONTENT_PREFIX)) {
+      return {
+        skill,
+        reason:
+          'its recorded body no longer matches SKILL.md on disk, ' +
+          'or its skill directory now resolves to a different path',
+        remedy: mismatchRemedy,
+      };
+    }
+    return {
+      skill,
+      reason: "the recorded tool response is not this skill's body",
+      // A refusal, not a body: no body was ever injected for this pair, so
+      // nothing this skill declares was armed in the recorded session either
+      // and nothing has been lost.
+      remedy: null,
+    };
   }
 
   /**
@@ -674,7 +730,7 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
    * and a user who wants the looser grant back can still type the slash
    * command.
    */
-  private restoreSkillSideEffects(skill: SkillConfig): void {
+  private async restoreSkillSideEffects(skill: SkillConfig): Promise<void> {
     // One predicate, shared with the availability filter that decides what the
     // model may call (`skillModelInvocationBlock`), rather than a second copy
     // of its three conditions here. All three can change between sessions, and
@@ -700,7 +756,18 @@ export class SkillTool extends BaseDeclarativeTool<SkillParams, ToolResult> {
       this.logSkillNotRestored(skill, reason, remedy);
       return;
     }
-    applySkillSideEffects(this.config, skill);
+    try {
+      await applySkillSideEffects(this.config, skill);
+    } catch (error) {
+      // Same tolerance as the live dedup path: the allow rules and hooks are
+      // registered before the review workflow activation that failed, and a
+      // failed activation must not abort the rest of the resume.
+      if (!(error instanceof ReviewWorkflowActivationError)) throw error;
+      debugLogger.warn(
+        `Review workflow activation failed while restoring skill "${skill.name}" on resume; workflow dispatch may be unavailable:`,
+        error,
+      );
+    }
   }
 
   /**
@@ -844,8 +911,8 @@ class SkillToolInvocation extends BaseToolInvocation<SkillParams, ToolResult> {
    * live) suspends the already-applied hooks and allow rules without a
    * restart, and a trust granted again restores them.
    */
-  private applySideEffects(skill: SkillConfig): void {
-    applySkillSideEffects(this.config, skill);
+  private async applySideEffects(skill: SkillConfig): Promise<void> {
+    await applySkillSideEffects(this.config, skill);
   }
 
   private async recordAutoSkillUsageBestEffort(
@@ -1061,6 +1128,24 @@ class SkillToolInvocation extends BaseToolInvocation<SkillParams, ToolResult> {
         new SkillLaunchEvent(this.params.skill, true, this.promptId),
       );
 
+      // Re-evaluated on every invocation, not just the first load: folder
+      // trust can be granted mid-session (IDE trust notifications flip it
+      // live), and a project skill first invoked while untrusted must not
+      // stay side-effect-less for the rest of the session. Both grants
+      // dedup, so re-applying is idempotent.
+      let activationWarning = '';
+      try {
+        await this.applySideEffects(skill);
+      } catch (error) {
+        if (
+          !(error instanceof ReviewWorkflowActivationError) ||
+          !this.isSkillLoaded(this.params.skill)
+        ) {
+          throw error;
+        }
+        activationWarning = ` Warning: review workflow activation failed (${error.message}); workflow dispatch may be unavailable.`;
+      }
+
       // Prevent re-invoking an already-loaded skill from appending
       // duplicate instructions to context. The first invocation
       // returns the full skill body; subsequent invocations return a
@@ -1069,14 +1154,8 @@ class SkillToolInvocation extends BaseToolInvocation<SkillParams, ToolResult> {
       // onSkillLoaded, which adds the name to the loaded set.
       if (this.isSkillLoaded(this.params.skill)) {
         this.onSkillLoaded(this.params.skill);
-        // Re-evaluated on every invocation, not just the first load: folder
-        // trust can be granted mid-session (IDE trust notifications flip it
-        // live), and a project skill first invoked while untrusted must not
-        // stay side-effect-less for the rest of the session. Both grants
-        // dedup, so re-applying is idempotent.
-        this.applySideEffects(skill);
         void this.recordAutoSkillUsageBestEffort(skill);
-        const msg = `Skill "${this.params.skill}" is already loaded in context.`;
+        const msg = `Skill "${this.params.skill}" is already loaded in context.${activationWarning}`;
         return {
           llmContent: msg,
           returnDisplay: msg,
@@ -1086,7 +1165,6 @@ class SkillToolInvocation extends BaseToolInvocation<SkillParams, ToolResult> {
       const baseDir = path.dirname(skill.filePath);
       const llmContent = buildSkillLlmContent(baseDir, skill.body);
       this.onSkillLoaded(this.params.skill, llmContent);
-      this.applySideEffects(skill);
 
       void this.recordAutoSkillUsageBestEffort(skill);
       recordSkillInvocation(this.config, {
