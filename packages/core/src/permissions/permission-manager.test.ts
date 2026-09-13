@@ -558,6 +558,31 @@ describe('splitCompoundCommand', () => {
     expect(splitCompoundCommand('echo a \\&& b')).toEqual(['echo a \\&', 'b']);
   });
 
+  // A backslash is literal inside single quotes, so `'a\'` is a CLOSED string
+  // and the operator after it is real structure. Reading the backslash as an
+  // escape swallowed the closing quote, held the scanner inside the quote to
+  // the end of input, and returned the whole line as one segment — so an
+  // `echo` allow rule authorised whatever followed. `bash -x` runs each of
+  // these as two commands.
+  it.each([
+    ["echo 'a\\' ; touch /tmp/x", ["echo 'a\\'", 'touch /tmp/x']],
+    ["echo 'a\\' && touch /tmp/x", ["echo 'a\\'", 'touch /tmp/x']],
+    ["echo 'a\\' | sh", ["echo 'a\\'", 'sh']],
+  ])(
+    'treats a backslash inside single quotes as literal in %s',
+    async (command, parts) => {
+      expect(splitCompoundCommand(command)).toEqual(parts);
+    },
+  );
+
+  it('still escapes a backslash inside double quotes', async () => {
+    // In double quotes a backslash does escape, so `"a\"` keeps the string
+    // open across the `;` and the whole thing is one command, matching bash.
+    expect(splitCompoundCommand('echo "a\\" ; touch /tmp/x"')).toEqual([
+      'echo "a\\" ; touch /tmp/x"',
+    ]);
+  });
+
   it('trims whitespace around sub-commands', async () => {
     expect(splitCompoundCommand('  git status  &&  rm -rf /  ')).toEqual([
       'git status',
@@ -2279,6 +2304,39 @@ describe('PermissionManager', () => {
         await pm.evaluate({
           toolName: 'run_shell_command',
           command: 'echo hello; rm -rf /',
+        }),
+      ).toBe('deny');
+    });
+
+    // A trailing backslash inside single quotes is literal in bash, so these
+    // are two commands and the second one is not covered by the echo rule.
+    // Reading that backslash as an escape kept the whole line in one segment,
+    // and the echo rule then authorised the command after the operator.
+    it('an allow rule does not reach past a single-quoted backslash', async () => {
+      pm = new PermissionManager(
+        makeConfig({ permissionsAllow: ['Bash(echo *)'] }),
+      );
+      pm.initialize();
+      expect(
+        await pm.evaluate({
+          toolName: 'run_shell_command',
+          command: "echo 'a\\' ; rm -rf /tmp/x",
+        }),
+      ).toBe('ask');
+    });
+
+    it('a deny rule still applies past a single-quoted backslash', async () => {
+      pm = new PermissionManager(
+        makeConfig({
+          permissionsAllow: ['Bash(echo *)'],
+          permissionsDeny: ['Bash(rm *)'],
+        }),
+      );
+      pm.initialize();
+      expect(
+        await pm.evaluate({
+          toolName: 'run_shell_command',
+          command: "echo 'a\\' ; rm -rf /tmp/x",
         }),
       ).toBe('deny');
     });

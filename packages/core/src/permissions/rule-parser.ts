@@ -877,7 +877,13 @@ export function splitCompoundCommandSegments(
       escaped = false;
       continue;
     }
-    if (ch === '\\') {
+    // A backslash is literal inside single quotes; only an unquoted or
+    // double-quoted backslash escapes the next character. Without the
+    // `!inSingle` guard, `echo 'a\' ; rm -rf x` treats the closing quote as
+    // escaped, holds the scanner inside the quote to the end of input, and
+    // returns the whole line as one segment — so an `echo` allow rule ends up
+    // authorising the `rm`.
+    if (ch === '\\' && !inSingle) {
       escaped = true;
       continue;
     }
