@@ -583,6 +583,34 @@ describe('splitCompoundCommand', () => {
     ]);
   });
 
+  // The other half of the rule. `$'…'` is bash's ANSI-C quoting, where the
+  // backslash IS an escape, so `$'a\''` ends at its second quote and the
+  // operator after it still separates two commands. Reading these as plain
+  // single quotes swallows the real closing quote instead and glues the line
+  // back into one segment — the same bypass, entered from the other side.
+  it.each([
+    ["echo $'a\\'' ; touch /tmp/x", ["echo $'a\\''", 'touch /tmp/x']],
+    ["echo $'a\\'' && touch /tmp/x", ["echo $'a\\''", 'touch /tmp/x']],
+    ["echo $'a\\'' | cat", ["echo $'a\\''", 'cat']],
+  ])(
+    'escapes a backslash inside ANSI-C quotes in %s',
+    async (command, parts) => {
+      expect(splitCompoundCommand(command)).toEqual(parts);
+    },
+  );
+
+  // A `$` only opens ANSI-C quoting when it is itself unquoted, unescaped and
+  // not already spent: bash reads all three of these as plain `'…'` strings,
+  // so the backslash is literal and the quote closes. Treating them as ANSI-C
+  // re-opens the plain-quote bypass through a different door.
+  it.each([
+    ["echo \\$'a\\' ; touch /tmp/x", ["echo \\$'a\\'", 'touch /tmp/x']],
+    ["echo $$'a\\' ; touch /tmp/x", ["echo $$'a\\'", 'touch /tmp/x']],
+    ['echo "$"\'a\\\' ; touch /tmp/x', ['echo "$"\'a\\\'', 'touch /tmp/x']],
+  ])('reads %s as a plain single-quoted string', async (command, parts) => {
+    expect(splitCompoundCommand(command)).toEqual(parts);
+  });
+
   it('trims whitespace around sub-commands', async () => {
     expect(splitCompoundCommand('  git status  &&  rm -rf /  ')).toEqual([
       'git status',
@@ -2337,6 +2365,37 @@ describe('PermissionManager', () => {
         await pm.evaluate({
           toolName: 'run_shell_command',
           command: "echo 'a\\' ; rm -rf /tmp/x",
+        }),
+      ).toBe('deny');
+    });
+
+    // `$'a\''` is a complete ANSI-C word, so bash runs these as two commands
+    // just as it does the plain-quote carrier above.
+    it('an allow rule does not reach past an ANSI-C quoted carrier', async () => {
+      pm = new PermissionManager(
+        makeConfig({ permissionsAllow: ['Bash(echo *)'] }),
+      );
+      pm.initialize();
+      expect(
+        await pm.evaluate({
+          toolName: 'run_shell_command',
+          command: "echo $'a\\'' ; rm -rf /tmp/x",
+        }),
+      ).toBe('ask');
+    });
+
+    it('a deny rule still applies past an ANSI-C quoted carrier', async () => {
+      pm = new PermissionManager(
+        makeConfig({
+          permissionsAllow: ['Bash(echo *)'],
+          permissionsDeny: ['Bash(rm *)'],
+        }),
+      );
+      pm.initialize();
+      expect(
+        await pm.evaluate({
+          toolName: 'run_shell_command',
+          command: "echo $'a\\'' ; rm -rf /tmp/x",
         }),
       ).toBe('deny');
     });

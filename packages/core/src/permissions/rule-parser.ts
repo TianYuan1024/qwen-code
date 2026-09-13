@@ -864,6 +864,13 @@ export function splitCompoundCommandSegments(
   const segments: CompoundCommandSegment[] = [];
   let inSingle = false;
   let inDouble = false;
+  // Whether the open single-quoted string is bash's ANSI-C form, `$'…'`, in
+  // which a backslash escapes — the opposite of a plain `'…'`, where it is a
+  // literal character.
+  let inAnsiC = false;
+  // A `$` still able to introduce `$'…'`: unquoted, unescaped, and not
+  // already spent as the second half of the `$$` PID expansion.
+  let dollarPending = false;
   let escaped = false;
   let lastSplit = 0;
   // Nesting depth of `$(( … ))` / `(( … ))`. Inside arithmetic a bare `&` is
@@ -872,22 +879,29 @@ export function splitCompoundCommandSegments(
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!;
+    // Consumed by this character: only a `$` immediately before an opening
+    // quote introduces `$'…'`.
+    const ansiCIntroducer: boolean = dollarPending;
+    dollarPending = false;
 
     if (escaped) {
       escaped = false;
       continue;
     }
-    // A backslash is literal inside single quotes; only an unquoted or
-    // double-quoted backslash escapes the next character. Without the
-    // `!inSingle` guard, `echo 'a\' ; rm -rf x` treats the closing quote as
-    // escaped, holds the scanner inside the quote to the end of input, and
-    // returns the whole line as one segment — so an `echo` allow rule ends up
-    // authorising the `rm`.
-    if (ch === '\\' && !inSingle) {
+    // A backslash is a literal character inside a plain `'…'` string and an
+    // escape everywhere else, ANSI-C `$'…'` included. Without the plain-quote
+    // exception, `echo 'a\' ; rm -rf x` reads the closing quote as escaped,
+    // stays inside the quote to the end of the input, and returns the whole
+    // line as one segment — so an `echo` allow rule ends up authorising the
+    // `rm`. Applying that exception to `$'…'` as well loses the same line the
+    // other way round: there the backslash really does escape, so `$'a\''`
+    // ends at its second quote and the operator after it still splits.
+    if (ch === '\\' && !(inSingle && !inAnsiC)) {
       escaped = true;
       continue;
     }
     if (ch === "'" && !inDouble) {
+      inAnsiC = inSingle ? false : ansiCIntroducer;
       inSingle = !inSingle;
       continue;
     }
@@ -896,6 +910,12 @@ export function splitCompoundCommandSegments(
       continue;
     }
     if (inSingle || inDouble) {
+      continue;
+    }
+    if (ch === '$') {
+      // `$$` expands to the PID and spends both characters, so the second one
+      // cannot open an ANSI-C string; `\$` and `"$"` never reach here.
+      dollarPending = !ansiCIntroducer;
       continue;
     }
 
