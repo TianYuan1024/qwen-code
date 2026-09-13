@@ -8,8 +8,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { logSkillLaunch, recordSkillInvocation } from '../telemetry/index.js';
 import { SkillTool, type SkillParams } from './skill.js';
 import type { Content, PartListUnion } from '@google/genai';
-import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'path';
 import type { ToolResultDisplay } from './tools.js';
 import type { Config } from '../config/config.js';
@@ -23,10 +21,7 @@ import {
   clearCollectedSkillEntriesCache,
   renderAvailableSkillsBlock,
 } from './skill-utils.js';
-import {
-  persistAndTruncateToolResult,
-  truncateAndSaveToFile,
-} from './truncation.js';
+import { TOOL_OUTPUT_TRUNCATED_PREFIX } from './truncation.js';
 import { recordAutoSkillUsage } from '../skills/skill-curator.js';
 import { registerSkillHooks } from '../hooks/registerSkillHooks.js';
 import { ToolNames } from './tool-names.js';
@@ -47,10 +42,7 @@ type SkillToolWithProtectedMethods = SkillTool & {
 };
 
 // Mock dependencies
-// The resume path's warn/debug split is a behavioural claim (#11180's
-// complaint is that nothing was logged at any level), so the logger has to be
-// observable. Only `createDebugLogger` is replaced; everything else in the
-// module keeps its real implementation.
+// Observable logger for the resume path's "not re-applied" lines.
 const mockDebugLogger = vi.hoisted(() => ({
   isEnabled: vi.fn().mockReturnValue(true),
   debug: vi.fn(),
@@ -752,11 +744,9 @@ describe('SkillTool', () => {
       expect(mockAddSessionAllowRule).toHaveBeenCalledTimes(2);
       expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Bash(curl *)', {
         trustGated: true,
-        sessionId: 'test-session-id',
       });
       expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Write', {
         trustGated: true,
-        sessionId: 'test-session-id',
       });
       expect(registerSkillHooks).toHaveBeenCalledTimes(1);
     });
@@ -799,7 +789,6 @@ describe('SkillTool', () => {
       // Not repository-controlled: never gated on folder trust.
       expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Bash(curl *)', {
         trustGated: false,
-        sessionId: 'test-session-id',
       });
       expect(registerSkillHooks).toHaveBeenCalledTimes(1);
     });
@@ -1000,11 +989,10 @@ describe('SkillTool', () => {
       expect(mockAddSessionAllowRule).toHaveBeenNthCalledWith(
         1,
         'Bash(git *)',
-        { trustGated: false, sessionId: 'test-session-id' },
+        { trustGated: false },
       );
       expect(mockAddSessionAllowRule).toHaveBeenNthCalledWith(2, 'Edit', {
         trustGated: false,
-        sessionId: 'test-session-id',
       });
     });
 
@@ -1571,16 +1559,16 @@ describe('SkillTool', () => {
         } as unknown as SkillConfig['hooks'],
       };
 
-      /** A resumed history whose only trace of `skill` is one Skill tool call. */
-      const resumedHistory = (skill: SkillConfig): Content[] => [
+      /** One Skill tool call for `name`, recorded with `output`. */
+      const pair = (id: string, name: string, output: string): Content[] => [
         {
           role: 'model',
           parts: [
             {
               functionCall: {
-                id: 'skill-call',
+                id,
                 name: ToolNames.SKILL,
-                args: { skill: skill.name },
+                args: { skill: name },
               },
             },
           ],
@@ -1590,25 +1578,27 @@ describe('SkillTool', () => {
           parts: [
             {
               functionResponse: {
-                id: 'skill-call',
+                id,
                 name: ToolNames.SKILL,
-                response: {
-                  output: buildSkillLlmContent(
-                    path.dirname(skill.filePath),
-                    skill.body,
-                  ),
-                },
+                response: { output },
               },
             },
           ],
         },
       ];
+      const bodyOf = (skill: SkillConfig) =>
+        buildSkillLlmContent(path.dirname(skill.filePath), skill.body);
+      const resumedHistory = (skill: SkillConfig): Content[] =>
+        pair('skill-call', skill.name, bodyOf(skill));
+      const notReapplied = (reason: string) =>
+        expect.stringContaining(
+          `Not re-applying the hooks and allowedTools of skill "gated-skill" on resume: ${reason}`,
+        );
 
       beforeEach(() => {
         vi.mocked(registerSkillHooks).mockClear();
         vi.mocked(mockSkillManager.listSkills).mockClear();
         mockDebugLogger.warn.mockClear();
-        mockDebugLogger.debug.mockClear();
         vi.mocked(config.isTrustedFolder).mockReturnValue(true);
         vi.mocked(config.getHookSystem).mockReturnValue({
           getSessionHooksManager: vi.fn().mockReturnValue({}),
@@ -1618,13 +1608,7 @@ describe('SkillTool', () => {
         ]);
       });
 
-      it('re-applies side effects for each restored Skill, so a resumed session keeps its gate', async () => {
-        // Session hooks and allow rules are in-memory only, so a resumed
-        // session starts with none. The restored body still carries the
-        // skill's instructions, and the dedup guard answers "already
-        // loaded", so nothing would prompt a re-invocation that
-        // re-registers them — the skill's PreToolUse gate would never fire
-        // again.
+      it('re-applies side effects for each restored Skill', async () => {
         await skillTool.restoreLoadedSkillsFromHistory(
           resumedHistory(gatedSkill),
         );
@@ -1635,63 +1619,50 @@ describe('SkillTool', () => {
         expect(registerSkillHooks).toHaveBeenCalledTimes(1);
         expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Edit', {
           trustGated: false,
-          // Scoped to the session that restored it: `PermissionManager`
-          // outlives a `/clear` or `/resume`, so an unscoped grant would keep
-          // auto-approving in a session that never loaded the skill.
-          sessionId: 'test-session-id',
         });
       });
 
-      it('does not re-arm a Skill the user disabled between sessions', async () => {
-        // The disabled skill is still in the resumed history. Both live
-        // paths refuse it before applying anything, so restoring its allow
-        // rules and hooks would silently switch an auto-approval back on
-        // after the user turned it off.
-        vi.mocked(config.isSkillEnabled).mockReturnValue(false);
+      it.each([
+        [
+          'disabled',
+          () => vi.mocked(config.isSkillEnabled).mockReturnValue(false),
+          gatedSkill,
+          'it is disabled',
+        ],
+        [
+          'inactive',
+          () =>
+            vi.mocked(mockSkillManager.isSkillActive).mockReturnValue(false),
+          gatedSkill,
+          'its `paths:` activation has not fired',
+        ],
+        [
+          'hidden',
+          () => {},
+          { ...gatedSkill, disableModelInvocation: true },
+          'it is hidden from model invocation',
+        ],
+      ] as const)(
+        'keeps the body but does not re-arm a %s Skill',
+        async (_state, arrange, skill, reason) => {
+          // Resume must never re-arm what a fresh tool call would refuse.
+          arrange();
+          vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([skill]);
 
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(gatedSkill),
-        );
+          await skillTool.restoreLoadedSkillsFromHistory(resumedHistory(skill));
 
-        // Bookkeeping still happens — the body is in the restored context,
-        // and the dedup guard has to know about it.
-        expect(skillTool.getLoadedSkillNames()).toEqual(
-          new Set(['gated-skill']),
-        );
-        expect(registerSkillHooks).not.toHaveBeenCalled();
-        expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
-      });
-
-      it('does not re-arm a conditional Skill whose `paths:` activation has not fired', async () => {
-        // `paths:` activation is in-memory too, so the skill starts the
-        // resumed session deactivated and `validateToolParams` would refuse
-        // it as "gated by path-based activation".
-        vi.mocked(mockSkillManager.isSkillActive).mockReturnValue(false);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(gatedSkill),
-        );
-
-        expect(skillTool.getLoadedSkillNames()).toEqual(
-          new Set(['gated-skill']),
-        );
-        expect(registerSkillHooks).not.toHaveBeenCalled();
-        expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('its `paths:` activation has not fired'),
-        );
-        // The remedy has to be a route the decline does not itself refuse:
-        // the model route is gated by this same condition, and the dedup
-        // guard answers "already loaded in context" on top of it.
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('run /gated-skill'),
-        );
-      });
+          expect(skillTool.getLoadedSkillNames()).toEqual(
+            new Set(['gated-skill']),
+          );
+          expect(registerSkillHooks).not.toHaveBeenCalled();
+          expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
+          expect(mockDebugLogger.warn).toHaveBeenCalledWith(
+            notReapplied(reason),
+          );
+        },
+      );
 
       it('does not re-arm a project Skill when the folder is no longer trusted', async () => {
-        // The folder-trust gate is re-applied on this path too: a project
-        // skill's hooks run repo-supplied commands, and resume must not be
-        // a way around the gate that both live paths enforce.
         const projectSkill: SkillConfig = {
           ...gatedSkill,
           level: 'project',
@@ -1707,499 +1678,77 @@ describe('SkillTool', () => {
           resumedHistory(projectSkill),
         );
 
-        expect(skillTool.getLoadedSkillNames()).toEqual(
-          new Set(['gated-skill']),
-        );
         expect(registerSkillHooks).not.toHaveBeenCalled();
         expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
       });
 
-      it('does not re-arm a Skill whose SKILL.md changed between sessions', async () => {
-        // The recorded body no longer matches disk, so the skill is not
-        // restored at all — neither the dedup bookkeeping nor its gate.
+      it.each([
+        [
+          'a body from an edited SKILL.md',
+          bodyOf({ ...gatedSkill, body: 'Older body.' }),
+        ],
+        ['a refusal', 'Skill "gated-skill" is disabled.'],
+        [
+          'a truncated body',
+          `${TOOL_OUTPUT_TRUNCATED_PREFIX}.\n${bodyOf(gatedSkill).slice(0, 40)}`,
+        ],
+      ])('does not re-arm from %s, and says so', async (_shape, output) => {
+        // None of these can be checked against the file on disk, so none
+        // may grant what the current frontmatter declares.
         await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory({ ...gatedSkill, body: 'A body from an older edit.' }),
+          pair('skill-call', 'gated-skill', output),
         );
 
         expect(skillTool.getLoadedSkillNames()).toEqual(new Set());
         expect(registerSkillHooks).not.toHaveBeenCalled();
         expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
-        // Diagnosability is the requirement here, not just the refusal: this
-        // branch used to be a bare `continue`, and a gate that vanishes in
-        // silence is what #11180 reported. Assert the reason, not the shared
-        // prefix, so it cannot be satisfied by a differently-caused message.
         expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'its recorded body does not match SKILL.md on disk',
+          notReapplied('no recorded response matches SKILL.md on disk'),
+        );
+      });
+
+      it('says nothing when a later pair restores the Skill an earlier one did not', async () => {
+        await skillTool.restoreLoadedSkillsFromHistory([
+          ...pair('stale', 'gated-skill', 'Skill "gated-skill" is disabled.'),
+          ...pair('current', 'gated-skill', bodyOf(gatedSkill)),
+          ...pair(
+            'again',
+            'gated-skill',
+            'Skill "gated-skill" is already loaded in context.',
           ),
-        );
-        // Nothing blocks this skill, so re-invoking it is the route that
-        // works; pinned positively, since every other remedy has a test.
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining(
-            're-invoke the skill to re-apply its hooks and allowedTools',
-          ),
-        );
-      });
-
-      it('does not re-arm a Skill that is now hidden from model invocation', async () => {
-        // Frontmatter is not part of the recorded body, so adding
-        // `disable-model-invocation: true` between sessions leaves the
-        // recorded output byte-identical and the mismatch check passes.
-        // `execute` refuses such a skill outright, so re-arming it would
-        // grant a session what no tool call can ask for.
-        const hiddenSkill: SkillConfig = {
-          ...gatedSkill,
-          disableModelInvocation: true,
-        };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          hiddenSkill,
         ]);
 
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(hiddenSkill),
-        );
-
-        expect(skillTool.getLoadedSkillNames()).toEqual(
-          new Set(['gated-skill']),
-        );
-        expect(registerSkillHooks).not.toHaveBeenCalled();
-        expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('it is hidden from model invocation'),
-        );
-        // And names the route that works. `execute` refuses a model-hidden
-        // skill outright, so "re-invoke the skill" would be advice the same
-        // condition refuses; the slash loader checks only enabledness and
-        // does re-arm it.
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('run /gated-skill'),
-        );
+        expect(registerSkillHooks).toHaveBeenCalledTimes(1);
+        expect(mockDebugLogger.warn).not.toHaveBeenCalled();
       });
 
-      describe('a body recorded in a shape other than verbatim', () => {
-        // `SkillTool` declares no `maxOutputChars`, so a body over the global
-        // budgets reaches the record through wrappers other modules own: the
-        // `<persisted-output>` stub, the budget-exhausted stub, the
-        // truncation wrapper, and the spill-failure fallback. `execute()`
-        // applied the side effects before any of them ran, so filing one as
-        // "not this skill's body" at `debug` would hide a lost gate. The
-        // records come from the real producers, not hand-built strings, so a
-        // new wrapper shape cannot slip past on a stale fixture.
-        const largeSkill: SkillConfig = {
-          ...gatedSkill,
-          body: 'Run the gate before every shell call.\n'.repeat(400),
-        };
-        const injected = () =>
-          buildSkillLlmContent(
-            path.dirname(largeSkill.filePath),
-            largeSkill.body,
-          );
-        let tmp: string;
+      it.each([
+        [
+          'declares no side effect',
+          { allowedTools: undefined, hooks: {} },
+          false,
+        ],
+        ['declares only allowedTools', { hooks: undefined }, true],
+      ] as const)(
+        'warns about a declined Skill only when it %s',
+        async (_case, overrides, warns) => {
+          const skill = { ...gatedSkill, ...overrides } as SkillConfig;
+          vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([skill]);
+          vi.mocked(config.isSkillEnabled).mockReturnValue(false);
 
-        beforeEach(async () => {
-          tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'skill-restore-'));
-          vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-            largeSkill,
-          ]);
-        });
+          await skillTool.restoreLoadedSkillsFromHistory(resumedHistory(skill));
 
-        afterEach(async () => {
-          await fs.rm(tmp, { recursive: true, force: true });
-        });
+          expect(mockDebugLogger.warn).toHaveBeenCalledTimes(warns ? 1 : 0);
+        },
+      );
 
-        const persistConfig = (bytesWritten: number) =>
-          ({
-            getToolResultBytesWritten: () => bytesWritten,
-            trackToolResultBytes: () => {},
-            storage: { getToolResultsDir: () => tmp },
-          }) as unknown as Config;
-        // A directory that cannot be created, so the spill write fails.
-        const unwritableDir = async () => {
-          const blocker = path.join(tmp, 'blocker');
-          await fs.writeFile(blocker, '');
-          return path.join(blocker, 'sub');
-        };
-
-        it.each<[string, () => Promise<string>]>([
-          [
-            'the <persisted-output> stub',
-            async () =>
-              (
-                await persistAndTruncateToolResult(
-                  'skill-call',
-                  ToolNames.SKILL,
-                  injected(),
-                  persistConfig(0),
-                )
-              ).content,
-          ],
-          [
-            'the budget-exhausted stub',
-            async () =>
-              (
-                await persistAndTruncateToolResult(
-                  'skill-call',
-                  ToolNames.SKILL,
-                  injected(),
-                  persistConfig(Number.MAX_SAFE_INTEGER),
-                )
-              ).content,
-          ],
-          [
-            'the truncation wrapper',
-            async () =>
-              (await truncateAndSaveToFile(injected(), 'skill', tmp, 1000, 20))
-                .content,
-          ],
-          [
-            'the spill-failure fallback keeping both ends',
-            async () =>
-              (
-                await truncateAndSaveToFile(
-                  injected(),
-                  'skill',
-                  await unwritableDir(),
-                  1000,
-                  20,
-                  'both',
-                )
-              ).content,
-          ],
-          [
-            'the spill-failure fallback keeping the tail',
-            async () =>
-              (
-                await truncateAndSaveToFile(
-                  injected(),
-                  'skill',
-                  await unwritableDir(),
-                  1000,
-                  20,
-                  'tail',
-                )
-              ).content,
-          ],
-        ])(
-          'declines to re-arm, and reports the lost gate, for %s',
-          async (_shape, produce) => {
-            const recorded = await produce();
-            expect(recorded.startsWith(injected())).toBe(false);
-            mockDebugLogger.warn.mockClear();
-            mockDebugLogger.debug.mockClear();
-
-            await skillTool.restoreLoadedSkillsFromHistory([
-              resumedHistory(largeSkill)[0],
-              {
-                role: 'user',
-                parts: [
-                  {
-                    functionResponse: {
-                      id: 'skill-call',
-                      name: ToolNames.SKILL,
-                      response: { output: recorded },
-                    },
-                  },
-                ],
-              },
-            ]);
-
-            // Withheld: the record cannot be compared against SKILL.md, so
-            // re-arming would grant whatever the current frontmatter declares
-            // on the strength of a record that cannot corroborate it.
-            expect(registerSkillHooks).not.toHaveBeenCalled();
-            expect(mockAddSessionAllowRule).not.toHaveBeenCalled();
-            // Reported as a lost gate, with a route, not as a record that
-            // never carried a body.
-            expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-              expect.stringContaining(
-                'its recorded body does not match SKILL.md on disk',
-              ),
-            );
-            expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-              expect.stringContaining('re-invoke the skill'),
-            );
-            expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
-              expect.stringContaining("is not this skill's body"),
-            );
-          },
-        );
-      });
-
-      it('keeps a body-shaped decline when a later refusal pair follows it', async () => {
-        // A skill invoked twice records a body and then the dedup message.
-        // When the body pair itself mismatches, the second pair must not
-        // overwrite it: `remedy: null` downgrades the warn to a debug line
-        // claiming nothing was ever armed, which is false for this history —
-        // the first pair did inject a body.
-        const [call] = resumedHistory(gatedSkill);
-        const staleThenDedup: Content[] = [
-          call,
-          {
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: buildSkillLlmContent(
-                      '/somewhere/else/gated-skill',
-                      'A body that no longer matches.',
-                    ),
-                  },
-                },
-              },
-            ],
-          },
-          {
-            role: 'model',
-            parts: [
-              {
-                functionCall: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  args: { skill: gatedSkill.name },
-                },
-              },
-            ],
-          },
-          {
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: `Skill "${gatedSkill.name}" is already loaded in context.`,
-                  },
-                },
-              },
-            ],
-          },
-        ];
-
-        await skillTool.restoreLoadedSkillsFromHistory(staleThenDedup);
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('does not match SKILL.md on disk'),
-        );
-      });
-
-      it('lets a later body-shaped decline displace an earlier refusal', async () => {
-        // The other ordering of the rank above. A skill refused while it was
-        // disabled, then re-enabled and invoked (so a body was injected), then
-        // edited before resume. First-write-wins would keep the refusal and
-        // log at `debug` that the record carries no body, hiding the gate the
-        // second pair armed.
-        const [call] = resumedHistory(gatedSkill);
-        const refusalThenStale: Content[] = [
-          call,
-          {
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: `Skill "${gatedSkill.name}" is disabled. Re-enable it via /skills or remove it from skills.disabled.`,
-                  },
-                },
-              },
-            ],
-          },
-          {
-            role: 'model',
-            parts: [
-              {
-                functionCall: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  args: { skill: gatedSkill.name },
-                },
-              },
-            ],
-          },
-          {
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: buildSkillLlmContent(
-                      '/somewhere/else/gated-skill',
-                      'A body that no longer matches.',
-                    ),
-                  },
-                },
-              },
-            ],
-          },
-        ];
-
-        await skillTool.restoreLoadedSkillsFromHistory(refusalThenStale);
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('does not match SKILL.md on disk'),
-        );
-        expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
-          expect.stringContaining("is not this skill's body"),
-        );
-      });
-
-      it('names the route the block allows when a mismatch and a block co-occur', async () => {
-        // The two co-occur by construction: the compared string embeds the
-        // base directory, so a moved checkout mismatches every skill, and
-        // `paths:` activation is in-memory, so a conditional skill is
-        // inactive in every resumed process. "Re-invoke the skill" is then
-        // advice `validateToolParams` refuses.
-        vi.mocked(mockSkillManager.isSkillActive).mockReturnValue(false);
-        const moved: Content[] = [
-          resumedHistory(gatedSkill)[0],
-          {
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: buildSkillLlmContent(
-                      '/an/older/checkout/gated-skill',
-                      gatedSkill.body,
-                    ),
-                  },
-                },
-              },
-            ],
-          },
-        ];
-
-        await skillTool.restoreLoadedSkillsFromHistory(moved);
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('run /gated-skill'),
-        );
-        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
-          expect.stringContaining('re-invoke the skill'),
-        );
-      });
-
-      it('does not send the operator to a slash command a Skill declares away', async () => {
-        // `user-invocable: false` is dropped by every dispatch-facing
-        // accessor, so `/gated-skill` answers `Unknown command`. Naming it
-        // alongside "the model route is refused" would leave the operator
-        // with no route at all; the one that works for `inactive` needs no
-        // command.
-        vi.mocked(mockSkillManager.isSkillActive).mockReturnValue(false);
-        const modelOnly: SkillConfig = { ...gatedSkill, userInvocable: false };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          modelOnly,
-        ]);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(modelOnly),
-        );
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('access a file matching its `paths:`'),
-        );
-        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
-          expect.stringContaining('run /gated-skill'),
-        );
-      });
-
-      it('names no route for a Skill hidden from the model and from the user', async () => {
-        const unreachable: SkillConfig = {
-          ...gatedSkill,
-          disableModelInvocation: true,
-          userInvocable: false,
-        };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          unreachable,
-        ]);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(unreachable),
-        );
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('no route re-arms it'),
-        );
-        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
-          expect.stringContaining('run /gated-skill'),
-        );
-      });
-
-      it('does not send a disabled user-invocable: false Skill to /skills', async () => {
-        // The `/skills` picker filters out `user-invocable: false` skills
-        // before building its toggleable list, so the settings key is the
-        // only way to re-enable one.
-        const modelOnly: SkillConfig = { ...gatedSkill, userInvocable: false };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          modelOnly,
-        ]);
-        vi.mocked(config.isSkillEnabled).mockReturnValue(false);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(modelOnly),
-        );
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'remove it from skills.disabled and then re-invoke it',
-          ),
-        );
-        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
-          expect.stringContaining('re-enable it via /skills'),
-        );
-        expect(mockDebugLogger.warn).not.toHaveBeenCalledWith(
-          expect.stringContaining('run /gated-skill'),
-        );
-      });
-
-      it('names folder trust as the precondition for a project Skill in an untrusted folder', async () => {
-        // Every route — the slash command included — goes through the same
-        // trust gate in `applySkillSideEffects`, so "run /gated-skill" alone
-        // would arm nothing. Declined here before that gate is ever reached,
-        // so this line is the only one the operator gets.
-        const projectSkill: SkillConfig = {
-          ...gatedSkill,
-          level: 'project',
-          filePath: '/project/.qwen/skills/gated-skill/SKILL.md',
-          skillRoot: '/project/.qwen/skills/gated-skill',
-        };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          projectSkill,
-        ]);
-        vi.mocked(config.isTrustedFolder).mockReturnValue(false);
-        vi.mocked(mockSkillManager.isSkillActive).mockReturnValue(false);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(projectSkill),
-        );
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining(
-            "until this folder is trusted nothing re-arms a project skill's hooks or allowedTools",
-          ),
-        );
-      });
-
-      it('binds a recorded invocation to the exactly-named Skill when names differ only by case', async () => {
-        // Both spellings are legal and both survive `collectCachedSkills`,
-        // which dedups by exact name. A case-folded lookup would bind the
-        // project `deploy` pair to the user `Deploy` entry and decline it.
+      it('binds a recorded invocation to the exactly-named Skill', async () => {
+        // `deploy` and `Deploy` are both legal and both kept by the cache.
         const projectDeploy: SkillConfig = {
           ...gatedSkill,
           name: 'deploy',
           level: 'project',
           filePath: '/project/.qwen/skills/deploy/SKILL.md',
-          skillRoot: '/project/.qwen/skills/deploy',
           allowedTools: ['Bash(npm *)'],
           hooks: undefined,
         };
@@ -2207,7 +1756,6 @@ describe('SkillTool', () => {
           ...gatedSkill,
           name: 'Deploy',
           filePath: '/home/user/.qwen/skills/Deploy/SKILL.md',
-          skillRoot: '/home/user/.qwen/skills/Deploy',
           allowedTools: undefined,
           hooks: undefined,
         };
@@ -2223,142 +1771,67 @@ describe('SkillTool', () => {
         expect(skillTool.getLoadedSkillNames()).toEqual(new Set(['deploy']));
         expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Bash(npm *)', {
           trustGated: true,
-          sessionId: 'test-session-id',
         });
-        expect(mockDebugLogger.warn).not.toHaveBeenCalled();
-        expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
-          expect.stringContaining('Not restoring skill'),
-        );
       });
 
-      it('finishes re-applying side effects before the restore resolves', async () => {
-        // The client awaits the restore before the resumed session takes a
-        // turn, so anything still in flight when it resolves is not in force
-        // for the first post-resume tool call. The bundled `review` skill is
-        // the one whose side effects include an asynchronous step.
+      describe('the bundled review skill', () => {
         const reviewSkill: SkillConfig = {
           ...gatedSkill,
           name: 'review',
           level: 'bundled',
           filePath: '/bundled/review/SKILL.md',
-          skillRoot: '/bundled/review',
         };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          reviewSkill,
-        ]);
-        let finishActivation!: () => void;
-        vi.mocked(config.enableReviewWorkflow).mockImplementation(
-          () =>
-            new Promise<void>((resolve) => {
-              finishActivation = resolve;
-            }),
-        );
 
-        let resolved = false;
-        const restoring = skillTool
-          .restoreLoadedSkillsFromHistory(resumedHistory(reviewSkill))
-          .then(() => {
-            resolved = true;
+        beforeEach(() => {
+          vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
+            reviewSkill,
+          ]);
+        });
+
+        it('finishes re-applying side effects before the restore resolves', async () => {
+          // Its workflow activation is the one asynchronous side effect.
+          let finishActivation!: () => void;
+          vi.mocked(config.enableReviewWorkflow).mockImplementation(
+            () =>
+              new Promise<void>((resolve) => {
+                finishActivation = resolve;
+              }),
+          );
+
+          let resolved = false;
+          const restoring = skillTool
+            .restoreLoadedSkillsFromHistory(resumedHistory(reviewSkill))
+            .then(() => {
+              resolved = true;
+            });
+          await vi.advanceTimersByTimeAsync(0);
+          expect(config.enableReviewWorkflow).toHaveBeenCalledTimes(1);
+          expect(resolved).toBe(false);
+
+          finishActivation();
+          await restoring;
+          expect(resolved).toBe(true);
+        });
+
+        it('does not fail the resume when its workflow cannot be activated', async () => {
+          vi.mocked(config.enableReviewWorkflow).mockRejectedValue(
+            new Error('workflow registry unavailable'),
+          );
+
+          await expect(
+            skillTool.restoreLoadedSkillsFromHistory(
+              resumedHistory(reviewSkill),
+            ),
+          ).resolves.toBeUndefined();
+          expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Edit', {
+            trustGated: false,
           });
-        await vi.advanceTimersByTimeAsync(0);
-
-        expect(config.enableReviewWorkflow).toHaveBeenCalledTimes(1);
-        expect(resolved).toBe(false);
-
-        finishActivation();
-        await restoring;
-        expect(resolved).toBe(true);
-      });
-
-      it('does not fail the resume when the review workflow cannot be activated', async () => {
-        const reviewSkill: SkillConfig = {
-          ...gatedSkill,
-          name: 'review',
-          level: 'bundled',
-          filePath: '/bundled/review/SKILL.md',
-          skillRoot: '/bundled/review',
-        };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          reviewSkill,
-        ]);
-        vi.mocked(config.enableReviewWorkflow).mockRejectedValue(
-          new Error('workflow registry unavailable'),
-        );
-
-        await expect(
-          skillTool.restoreLoadedSkillsFromHistory(resumedHistory(reviewSkill)),
-        ).resolves.toBeUndefined();
-
-        // The allow rules and hooks are registered before the activation.
-        expect(registerSkillHooks).toHaveBeenCalledTimes(1);
-        expect(mockAddSessionAllowRule).toHaveBeenCalledWith('Edit', {
-          trustGated: false,
-          sessionId: 'test-session-id',
         });
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'Review workflow activation failed while restoring skill "review"',
-          ),
-          expect.anything(),
-        );
-      });
-
-      it('does not blame SKILL.md for a same-session re-invocation replayed in the history', async () => {
-        // A skill invoked twice records the body once and the dedup message
-        // ("already loaded in context") the second time. That second pair is
-        // not a body, so attributing it to an edited SKILL.md would tell an
-        // operator their gate is gone while the same loop has just armed it.
-        const [call, response] = resumedHistory(gatedSkill);
-        const reinvocation: Content[] = [
-          call,
-          response,
-          {
-            role: 'model',
-            parts: [
-              {
-                functionCall: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  args: { skill: gatedSkill.name },
-                },
-              },
-            ],
-          },
-          {
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: `Skill "${gatedSkill.name}" is already loaded in context.`,
-                  },
-                },
-              },
-            ],
-          },
-        ];
-
-        await skillTool.restoreLoadedSkillsFromHistory(reinvocation);
-
-        expect(skillTool.getLoadedSkillNames()).toEqual(
-          new Set(['gated-skill']),
-        );
-        expect(registerSkillHooks).toHaveBeenCalledTimes(1);
-        expect(mockDebugLogger.warn).not.toHaveBeenCalled();
       });
 
       it('awaits discovery when the skill cache has not committed yet', async () => {
-        // Nothing sequences restore against the constructor's fire-and-forget
-        // `refreshSkills()`. A cold cache is `null`, not empty, so restore
-        // waits for one refresh instead of declining every Skill in the
-        // history — which for a gate Skill would be exactly #11180 again, with
-        // a debug line as the only trace.
-        // Order-sensitive on purpose: the cache commits only when the
-        // discovery promise settles, so an oracle that hands the skill back
-        // regardless of timing would stay green with the `await` replaced by
-        // a bare call — the mutation this test exists to catch.
+        // Order-sensitive: the cache commits only once discovery settles, so
+        // a restore that did not await it would find nothing.
         let committed = false;
         vi.mocked(mockSkillManager.listSkills).mockImplementation(async () => {
           await Promise.resolve();
@@ -2373,200 +1846,10 @@ describe('SkillTool', () => {
           resumedHistory(gatedSkill),
         );
 
-        expect(mockSkillManager.listSkills).toHaveBeenCalled();
-        expect(skillTool.getLoadedSkillNames()).toEqual(
-          new Set(['gated-skill']),
-        );
         expect(registerSkillHooks).toHaveBeenCalledTimes(1);
-      });
-
-      it('warns, not debugs, when the Skill it declined to re-arm declares hooks', async () => {
-        // Inside the debug log the level is what an operator greps first, and
-        // these declines previously logged nothing at any level. Pin `warn`
-        // for a hook-declaring Skill so a future edit cannot collapse this to
-        // `debug` and stay green. It is not operator visibility: `warn` and
-        // `debug` share one sink gated only on `QWEN_DEBUG_LOG_FILE`, so
-        // surfacing a missing gate without `--debug` is still open.
-        vi.mocked(config.isSkillEnabled).mockReturnValue(false);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(gatedSkill),
-        );
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'Not restoring skill "gated-skill" on resume: it is disabled',
-          ),
-        );
-        // A disabled skill is filtered out of the command registry too, so
-        // the slash route is no route either until it is re-enabled.
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('re-enable it via /skills'),
-        );
-        expect(mockDebugLogger.debug).not.toHaveBeenCalled();
-      });
-
-      it('debugs, not warns, when the Skill it declined to re-arm declares no side effect', async () => {
-        // `hooks: {}` is truthy, and the parser assigns one for an empty block
-        // and for a block whose event names are all unrecognised. A Skill that
-        // declares neither a non-empty hooks block nor any allowedTools
-        // promised nothing, so warning about its absence would be the phantom
-        // failure `applySkillHooks`'s emptiness check exists to avoid. The
-        // fixture drops `allowedTools` as well: with it inherited, this case
-        // would be pinning `debug` for a Skill that did promise an
-        // auto-approval.
-        const inertSkill: SkillConfig = {
-          ...gatedSkill,
-          allowedTools: undefined,
-          hooks: {} as unknown as SkillConfig['hooks'],
-        };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          inertSkill,
-        ]);
-        vi.mocked(config.isSkillEnabled).mockReturnValue(false);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(inertSkill),
-        );
-
-        expect(mockDebugLogger.debug).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'Not restoring skill "gated-skill" on resume: it is disabled',
-          ),
-        );
-        expect(mockDebugLogger.warn).not.toHaveBeenCalled();
-      });
-
-      it('warns when the Skill it declined to re-arm declares only allowedTools', async () => {
-        // A lost auto-approval is as invisible as a lost gate and reads the
-        // same way from the transcript, and the message names both halves.
-        // Nine bundled Skills declare `allowedTools` and none declares
-        // `hooks:`, so a level keyed on hooks alone would leave every one of
-        // them declining below default verbosity.
-        const grantOnlySkill: SkillConfig = {
-          ...gatedSkill,
-          hooks: undefined,
-        };
-        vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([
-          grantOnlySkill,
-        ]);
-        vi.mocked(config.isSkillEnabled).mockReturnValue(false);
-
-        await skillTool.restoreLoadedSkillsFromHistory(
-          resumedHistory(grantOnlySkill),
-        );
-
-        expect(mockDebugLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'Not restoring skill "gated-skill" on resume: it is disabled',
-          ),
-        );
-      });
-
-      it.each([
-        'Skill "gated-skill" is disabled. Re-enable it via /skills or remove it from skills.disabled.',
-        'Skill "gated-skill" not found.',
-        'Skill "gated-skill" is already loaded in context.',
-        'Failed to load skill "gated-skill": EACCES',
-      ])(
-        'does not warn about a lost gate when the recorded response carries no body: %s',
-        async (output) => {
-          // These are the strings `execute()` returns in place of a body, so
-          // the record carries nothing to re-arm and warning would repeat on
-          // every resume of that session. `remedy: null` is safe only for
-          // this closed set — any other unmatched record is read as a body
-          // that cannot be corroborated (see the wrapper cases above).
-          const refusalHistory: Content[] = [
-            resumedHistory(gatedSkill)[0],
-            {
-              role: 'user',
-              parts: [
-                {
-                  functionResponse: {
-                    id: 'skill-call',
-                    name: ToolNames.SKILL,
-                    response: { output },
-                  },
-                },
-              ],
-            },
-          ];
-
-          await skillTool.restoreLoadedSkillsFromHistory(refusalHistory);
-
-          expect(skillTool.getLoadedSkillNames()).toEqual(new Set());
-          expect(mockDebugLogger.warn).not.toHaveBeenCalled();
-          expect(mockDebugLogger.debug).toHaveBeenCalledWith(
-            expect.stringContaining(
-              "the recorded tool response is not this skill's body. That response carries no body for it",
-            ),
-          );
-        },
-      );
-
-      it('does not warn when a later pair restores the Skill an earlier one declined', async () => {
-        // The loop walks pairs, but the warning is about the session, so it
-        // cannot be decided per pair. A skill invoked, then edited, then
-        // invoked again records a stale body first and the current one
-        // second: the first pair mismatches and the second restores and
-        // re-arms. Logged inline, the operator gets "your gate is gone" for
-        // a gate armed two pairs later, and the remedy it names is refused by
-        // the dedup guard.
-        const [staleCall, staleResponse] = resumedHistory({
-          ...gatedSkill,
-          body: 'A body from an older edit.',
-        });
-        const [call, response] = resumedHistory(gatedSkill);
-        const staleThenCurrent: Content[] = [
-          staleCall,
-          staleResponse,
-          {
-            ...(call as Content),
-            parts: [
-              {
-                functionCall: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  args: { skill: gatedSkill.name },
-                },
-              },
-            ],
-          },
-          {
-            ...(response as Content),
-            parts: [
-              {
-                functionResponse: {
-                  id: 'skill-call-2',
-                  name: ToolNames.SKILL,
-                  response: {
-                    output: buildSkillLlmContent(
-                      path.dirname(gatedSkill.filePath),
-                      gatedSkill.body,
-                    ),
-                  },
-                },
-              },
-            ],
-          },
-        ];
-
-        await skillTool.restoreLoadedSkillsFromHistory(staleThenCurrent);
-
-        expect(skillTool.getLoadedSkillNames()).toEqual(
-          new Set(['gated-skill']),
-        );
-        expect(registerSkillHooks).toHaveBeenCalledTimes(1);
-        expect(mockDebugLogger.warn).not.toHaveBeenCalled();
       });
 
       it('does not scan when the skill cache has committed empty', async () => {
-        // The cold-cache guard is safe only because a committed cache makes it
-        // a no-op, and `null` means "no refresh has committed yet" while `[]`
-        // means "scanned, and there are none". Loosening the guard to
-        // `!cachedSkills?.length` reads as a strict improvement and survives
-        // every other case in this block — only a warm-but-empty cache
-        // separates the two.
         vi.mocked(mockSkillManager.getCachedSkills).mockReturnValue([]);
 
         await skillTool.restoreLoadedSkillsFromHistory(

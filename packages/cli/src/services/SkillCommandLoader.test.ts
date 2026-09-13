@@ -314,19 +314,16 @@ describe('SkillCommandLoader', () => {
       vi.mocked(mockConfig.isTrustedFolder).mockReturnValue(true);
       await runProjectSkill();
       expect(mockAddSessionAllowRule).toHaveBeenCalledTimes(2);
-      // Exactly `{ trustGated: true, sessionId }`: suspension keys solely
-      // off the flag, so a `/my-skill`-invoked project skill whose grants
-      // shipped ungated would silently escape the mid-session revocation;
-      // the session id scopes the grant to the session that ran the command,
-      // because the permission manager outlives a session swap.
+      // Exactly `{ trustGated: true }`: suspension keys solely off the
+      // flag, so a `/my-skill`-invoked project skill whose grants shipped
+      // ungated would silently escape the mid-session revocation.
       expect(mockAddSessionAllowRule).toHaveBeenNthCalledWith(
         1,
         'Bash(curl *)',
-        { trustGated: true, sessionId: 'session-1' },
+        { trustGated: true },
       );
       expect(mockAddSessionAllowRule).toHaveBeenNthCalledWith(2, 'Write', {
         trustGated: true,
-        sessionId: 'session-1',
       });
     });
   });
@@ -581,12 +578,10 @@ describe('SkillCommandLoader', () => {
         'Bash(git *)',
         {
           trustGated: false,
-          sessionId: 'session-1',
         },
       );
       expect(mockAddSessionAllowRule).toHaveBeenNthCalledWith(2, 'Edit', {
         trustGated: false,
-        sessionId: 'session-1',
       });
     });
 

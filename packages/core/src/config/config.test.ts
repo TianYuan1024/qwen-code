@@ -3526,16 +3526,9 @@ describe('Server Config (config.ts)', () => {
       expect(clearLoadedSkills).toHaveBeenCalledOnce();
     });
 
-    it("drops a skill's session allow rule at the session boundary, keeping an unscoped one", async () => {
-      // The other half of what `clearLoadedSkills` above does: a skill's
-      // `allowedTools` are granted as session allow rules, and
-      // `PermissionManager` is built once per process — `startNewSession`
-      // never touches `sessionRules`. Without the session scoping the grant
-      // would keep auto-approving in a session that never loaded the skill,
-      // has no body in context and shows no trace of where the approval came
-      // from. Driven through `applySkillSideEffects` with a real `Config` and
-      // a real `PermissionManager`, so the whole chain is pinned — the id the
-      // grant is tagged with is the one `startNewSession` replaces.
+    it("drops a skill's session allow rules at the session boundary", async () => {
+      // `PermissionManager` outlives the swap, so without the purge a skill's
+      // grant would keep auto-approving in a session that never loaded it.
       const config = new Config({ ...baseParams });
       await config.initialize({
         skipLlmInitialization: true,
@@ -3549,7 +3542,6 @@ describe('Server Config (config.ts)', () => {
         toolName: ToolNames.SHELL,
         command: 'git push origin main',
       };
-      const userGranted = { toolName: ToolNames.SHELL, command: 'ls -la' };
 
       await applySkillSideEffects(config, {
         name: 'gated-skill',
@@ -3559,17 +3551,11 @@ describe('Server Config (config.ts)', () => {
         body: 'Body.',
         allowedTools: ['Bash(git *)'],
       } as unknown as SkillConfig);
-      // An unscoped grant must survive. Nothing in-tree produces one — a
-      // user's "Always allow" is a persistent rule — so this stands for the
-      // defensive branch, not a live user path.
-      permissionManager.addSessionAllowRule('Bash(ls *)');
       expect(await permissionManager.evaluate(gitPush)).toBe('allow');
-      expect(await permissionManager.evaluate(userGranted)).toBe('allow');
 
       config.startNewSession('replacement-session');
 
       expect(await permissionManager.evaluate(gitPush)).toBe('ask');
-      expect(await permissionManager.evaluate(userGranted)).toBe('allow');
     });
 
     it('records no lifecycle transition when resuming the current session id', async () => {

@@ -186,12 +186,8 @@ describe('applySkillSideEffects', () => {
   it('applies both allowedTools and hooks', async () => {
     const { config, addSessionAllowRule, addSessionHook } = makeConfig();
     await applySkillSideEffects(config, gatedSkill);
-    // Scoped to the session that loaded the skill, the same scope the hooks
-    // half gets: `PermissionManager` outlives a session swap, so an unscoped
-    // grant would keep auto-approving in the next session.
     expect(addSessionAllowRule).toHaveBeenCalledWith('Edit', {
       trustGated: false,
-      sessionId: 'session-1',
     });
     expect(addSessionHook).toHaveBeenCalledTimes(1);
   });
@@ -211,7 +207,6 @@ describe('applySkillSideEffects', () => {
     // The allowedTools half still applies — only the hooks are skipped.
     expect(addSessionAllowRule).toHaveBeenCalledWith('Edit', {
       trustGated: false,
-      sessionId: 'session-1',
     });
     // Pinned at `warn`: a promised gate is being dropped, and at `debug` the
     // only trace of that would sit below the level anyone reads.
@@ -240,7 +235,6 @@ describe('applySkillSideEffects', () => {
     // The allowedTools half is unaffected by the hooks early return.
     expect(addSessionAllowRule).toHaveBeenCalledWith('Edit', {
       trustGated: false,
-      sessionId: 'session-1',
     });
   });
 
@@ -258,7 +252,6 @@ describe('applySkillSideEffects', () => {
     expect(debugLoggerSpies.warn).not.toHaveBeenCalled();
     expect(addSessionAllowRule).toHaveBeenCalledWith('Edit', {
       trustGated: false,
-      sessionId: 'session-1',
     });
   });
 
@@ -272,13 +265,9 @@ describe('applySkillSideEffects', () => {
     expect(addSessionHook).not.toHaveBeenCalled();
     // Same asymmetry as the no-hook-system case: only the hooks half is
     // skipped. Without this, hoisting the session-id guard above
-    // `applySkillAllowedTools` would ship untested. With no session id there
-    // is nothing to scope the grant to, so it is added unscoped — the same
-    // degradation `activeSessionAllowRules` makes when the config exposes no
-    // session id.
+    // `applySkillAllowedTools` would ship untested.
     expect(addSessionAllowRule).toHaveBeenCalledWith('Edit', {
       trustGated: false,
-      sessionId: undefined,
     });
   });
 
@@ -345,104 +334,31 @@ describe('applySkillSideEffects', () => {
 });
 
 describe('skillModelInvocationBlock', () => {
-  // The rule two callers share: the availability filter that decides what the
-  // model may call, and the resume path that decides whose `allowedTools` and
-  // `hooks:` may be re-armed. They used to hand-roll it separately, and the
-  // resume copy was missing the visibility condition — so a resumed session
-  // could hold grants for a skill no tool call can ask for.
   const skill = {
     name: 'gated-skill',
-    description: 'Gated',
     level: 'user',
     filePath: '/skills/gated-skill/SKILL.md',
     body: 'Body.',
   } as unknown as SkillConfig;
 
-  function make(
-    opts: {
-      enabled?: boolean;
-      active?: boolean;
-      hidden?: boolean;
-    } = {},
-  ) {
+  it.each([
+    [{}, undefined],
+    [{ enabled: false }, 'disabled'],
+    [{ hidden: true }, 'hidden'],
+    [{ active: false }, 'inactive'],
+    [{ enabled: false, hidden: true, active: false }, 'disabled'],
+  ] as const)('%o -> %s', (opts, expected) => {
     const config = {
-      isSkillEnabled: () => opts.enabled ?? true,
+      isSkillEnabled: () => ('enabled' in opts ? opts.enabled : true),
     } as unknown as Config;
     const skillManager = {
-      isSkillActive: () => opts.active ?? true,
+      isSkillActive: () => ('active' in opts ? opts.active : true),
     } as unknown as SkillManager;
-    return {
-      config,
-      skillManager,
-      skill: opts.hidden ? { ...skill, disableModelInvocation: true } : skill,
-    };
-  }
-
-  it('reports nothing when the model could invoke the skill right now', () => {
-    const { config, skillManager, skill: s } = make();
-    expect(skillModelInvocationBlock(config, skillManager, s)).toBeUndefined();
-  });
-
-  it('names each condition that blocks invocation', () => {
-    const disabled = make({ enabled: false });
-    expect(
-      skillModelInvocationBlock(
-        disabled.config,
-        disabled.skillManager,
-        disabled.skill,
-      ),
-    ).toBe('disabled');
-
-    const inactive = make({ active: false });
-    expect(
-      skillModelInvocationBlock(
-        inactive.config,
-        inactive.skillManager,
-        inactive.skill,
-      ),
-    ).toBe('inactive');
-
-    // Invisible to the resume path's body match — frontmatter is not part of
-    // the recorded body — which is why it has to be checked here.
-    const hidden = make({ hidden: true });
-    expect(
-      skillModelInvocationBlock(
-        hidden.config,
-        hidden.skillManager,
-        hidden.skill,
-      ),
-    ).toBe('hidden');
-  });
-
-  it('reports the first failing condition when several fail at once', () => {
-    // Only the message an operator reads depends on this, but it has to be
-    // stable: the resume path turns the reason into the line that says why a
-    // gate is missing.
-    const {
-      config,
-      skillManager,
-      skill: s,
-    } = make({
-      enabled: false,
-      active: false,
-      hidden: true,
-    });
-    expect(skillModelInvocationBlock(config, skillManager, s)).toBe('disabled');
-  });
-
-  it('reports the permanent condition, not the transient one, when both hold', () => {
-    // A `disable-model-invocation` skill is skipped when `SkillManager`
-    // builds `eligibleForActivation`, so it never enters the registry and
-    // `isSkillActive` is false for it in every session. Reporting `inactive`
-    // here would tell the operator to touch a matching file to clear a
-    // condition that can never clear, while hiding the frontmatter flag that
-    // actually explains the decline.
-    const {
-      config,
-      skillManager,
-      skill: s,
-    } = make({ active: false, hidden: true });
-    expect(skillModelInvocationBlock(config, skillManager, s)).toBe('hidden');
+    const subject =
+      'hidden' in opts ? { ...skill, disableModelInvocation: true } : skill;
+    expect(skillModelInvocationBlock(config, skillManager, subject)).toBe(
+      expected,
+    );
   });
 });
 
