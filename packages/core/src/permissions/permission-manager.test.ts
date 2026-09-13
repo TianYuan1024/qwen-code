@@ -611,6 +611,19 @@ describe('splitCompoundCommand', () => {
     expect(splitCompoundCommand(command)).toEqual(parts);
   });
 
+  // Which form a string has is decided independently for each string, so the
+  // two can be mixed on one line in either order, and `$$$'…'` is the PID
+  // expansion followed by a real ANSI-C string. Characterisation of shapes the
+  // cases above do not reach; bash runs every line here as two commands.
+  it.each([
+    ["echo $'a\\'' 'c\\' ; echo B", ["echo $'a\\'' 'c\\'", 'echo B']],
+    ["echo 'a' $'b\\'' ; echo B", ["echo 'a' $'b\\''", 'echo B']],
+    ["echo $$$'a\\'' ; echo B", ["echo $$$'a\\''", 'echo B']],
+    ["echo $'\\'' ; echo B", ["echo $'\\''", 'echo B']],
+  ])('tracks the quote form per string in %s', async (command, parts) => {
+    expect(splitCompoundCommand(command)).toEqual(parts);
+  });
+
   it('trims whitespace around sub-commands', async () => {
     expect(splitCompoundCommand('  git status  &&  rm -rf /  ')).toEqual([
       'git status',
